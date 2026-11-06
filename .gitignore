@@ -13,3 +13,5 @@ ugali/data/*/
 healpix
 mask
 *.tar.gz
+artifacts/
+instruction.md
