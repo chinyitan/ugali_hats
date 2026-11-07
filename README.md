@@ -125,6 +125,34 @@ The isochrones used by `ugali` come dominantly from:
 
 More information can be found in the [isochrone](ugali/isochrone) module.
 
+#### HATS catalog input and parallel scans
+Catalogs in the [HATS](https://hats.readthedocs.io) format (healpix-partitioned
+parquet) can be used in place of the per-pixel FITS catalog files by replacing
+`dirname`/`basename` in the `catalog` section of the config with:
+```yaml
+catalog:
+  hats:
+    path: /path/to/hats_catalog   # directory containing partition_info.csv
+    max_tiles: 64                 # partitions kept in the per-process LRU cache
+  # ...the usual lon_field, mag_1_field, selection, ... keys
+```
+Partitions are read with `pyarrow` through a least-recently-used cache
+(`ugali.observation.hats_catalog`), so neighbouring ROIs share IO; the
+selection cut is applied per partition before caching. The rows loaded for a
+ROI are the same as those the FITS path reads, so results are identical. The
+mask files are still read from `mask: dirname`.
+
+`ugali/analysis/scan_parallel.py` runs the likelihood scan for many pixels on
+one machine with a pool of long-lived workers (pixels are sorted by NESTED
+index so that neighbours share a worker's cache), with per-pixel resume and
+timing/cache statistics:
+```
+python ugali/analysis/scan_parallel.py config.yaml --pixels 639648 640671 -n 4 --stats-file stats.csv
+python ugali/analysis/scan_parallel.py config.yaml --hpxlist pixels.txt -n -1
+```
+See `notebooks/hats_io_validation.ipynb` for the validation against the FITS
+path and timings, and `tests/test_des_scan.py` / `tests/test_hats_catalog.py`.
+
 #### Abbreviations
 * CMD: color-magnitude diagram
 * ROI: region of interest
