@@ -144,8 +144,12 @@ mask files are still read from `mask: dirname`.
 
 `ugali/analysis/scan_parallel.py` runs the likelihood scan for many pixels on
 one machine with a pool of long-lived workers (pixels are sorted by NESTED
-index so that neighbours share a worker's cache), with per-pixel resume and
-timing/cache statistics:
+index so that neighbours share a worker's cache). It is built for long,
+resumable runs: outputs are written atomically and existing ones are skipped
+unless `--force`, per-pixel timing/cache statistics are appended to
+`--stats-file` as pixels finish, a worker that dies (e.g. OOM) triggers a pool
+restart with the unfinished work resubmitted, and the default `-n -1` is
+limited by available memory (~4 GB per worker):
 ```
 python ugali/analysis/scan_parallel.py config.yaml --pixels 639648 640671 -n 4 --stats-file stats.csv
 python ugali/analysis/scan_parallel.py config.yaml --hpxlist pixels.txt -n -1

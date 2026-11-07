@@ -6,12 +6,25 @@ Workers are forked once and live for the whole run, so the per-process HATS
 tile cache (ugali.observation.hats_catalog) persists across pixels.  Pixels
 are sorted by NESTED index and handed out in contiguous chunks so that
 neighbouring pixels (which share HATS partitions) go to the same worker.
+
+Designed for long, resumable runs:
+  * each pixel's output is written atomically (temp file + rename), and
+    pixels whose output exists are skipped unless --force;
+  * per-pixel statistics are appended to the stats file as pixels finish;
+  * a worker that dies (OOM kill, segfault) does not hang the run: the pool
+    is restarted and the unfinished chunks are resubmitted (up to
+    --max-restarts times), relying on the resume logic to skip what is done;
+  * the default number of workers is limited by the available memory.
 """
 import os
 import sys
 import csv
 import time
+import signal
+import traceback
 import multiprocessing as mp
+from concurrent.futures import ProcessPoolExecutor, wait, FIRST_COMPLETED
+from concurrent.futures.process import BrokenProcessPool
 from os.path import exists, dirname
 
 import numpy as np
@@ -27,7 +40,10 @@ from ugali.utils.shell import mkdir
 STAT_FIELDS = ['pix', 'lon', 'lat', 'runtime_s', 'hits', 'misses',
                'bytes_read', 'rows_read', 'read_time', 'pid', 'status', 'error']
 
-# Per-process state, set by _init (before fork, inherited by workers).
+# Memory needed per worker for a DES-like scan (measured ~3.6 GB RSS)
+MEMORY_PER_WORKER_GB = 4.0
+
+# Per-process state, set before forking and inherited by the workers.
 _STATE = {}
 
 
@@ -55,7 +71,7 @@ def select_pixels(configfile, coords=None, pixels=None, minpix=None,
 
     inside = ugali.utils.skymap.inFootprint(config, pixels)
     if inside.sum() != len(pixels):
-        logger.warning("Ignoring pixels outside survey footprint:\n" + str(pixels[~inside]))
+        logger.warning("Ignoring %i pixels outside survey footprint" % (~inside).sum())
     pixels = pixels[inside]
 
     if minpix is not None: pixels = pixels[pixels >= minpix]
@@ -74,12 +90,58 @@ def sort_nested(nside, pixels):
     return pixels[np.argsort(nest, kind='stable')]
 
 
+def available_memory_gb():
+    """ Available system memory in GB (Linux /proc/meminfo), or None. """
+    try:
+        with open('/proc/meminfo') as f:
+            for line in f:
+                if line.startswith('MemAvailable:'):
+                    return float(line.split()[1]) / 1024**2
+    except (IOError, ValueError):
+        pass
+    return None
+
+
+def default_n_jobs(requested=None):
+    """ Number of workers: requested, or all CPUs limited by memory. """
+    ncpu = os.cpu_count() or 1
+    n = ncpu if (requested is None or requested < 0) else max(1, requested)
+    mem = available_memory_gb()
+    if mem is not None:
+        nmem = max(1, int(mem // MEMORY_PER_WORKER_GB))
+        if requested is None or requested < 0:
+            n = min(n, nmem)
+        elif n > nmem:
+            logger.warning("%i workers x ~%.0f GB exceeds available memory (%.0f GB)"
+                           % (n, MEMORY_PER_WORKER_GB, mem))
+    return n
+
+
 def _cache_snapshot(config):
-    """ Return reader.stats copy, or None if the config has no HATS catalog. """
+    """ Return a copy of reader.stats, or None if the config has no HATS catalog. """
     if 'hats' not in (config['catalog'] or {}):
         return None
     from ugali.observation.hats_catalog import get_reader
     return dict(get_reader(config).stats)
+
+
+def _outfile(config, pix):
+    return config.likefile % (pix, config['coords']['coordsys'].lower())
+
+
+def _append_stats(rec):
+    """ Append one record to the stats file (workers share the lock). """
+    stats_file = _STATE.get('stats_file')
+    if not stats_file:
+        return
+    lock = _STATE.get('lock')
+    if lock is not None: lock.acquire()
+    try:
+        with open(stats_file, 'a', newline='') as f:
+            csv.DictWriter(f, fieldnames=STAT_FIELDS).writerow(rec)
+            f.flush()
+    finally:
+        if lock is not None: lock.release()
 
 
 def scan_pixel(pix):
@@ -89,7 +151,7 @@ def scan_pixel(pix):
     nside = _STATE['nside']
     force = _STATE['force']
 
-    outfile = config.likefile % (pix, config['coords']['coordsys'].lower())
+    outfile = _outfile(config, pix)
     rec = dict(pix=int(pix), lon=np.nan, lat=np.nan, runtime_s=0.0, hits=0,
                misses=0, bytes_read=0, rows_read=0, read_time=0.0,
                pid=os.getpid(), status='ok', error='')
@@ -98,33 +160,86 @@ def scan_pixel(pix):
         return rec
 
     t0 = time.time()
+    tmpfile = outfile + '.tmp'
     try:
         # Same convention as scan.py --hpx: pix2ang passed straight through.
         lon, lat = pix2ang(nside, pix)
         rec['lon'], rec['lat'] = float(lon), float(lat)
         before = _cache_snapshot(config)
-        # Pass the Config object (not the filename) so that overrides such
-        # as --max-tiles reach the workers and the YAML is parsed only once.
+        # The Config object (not the filename) is passed so that overrides
+        # such as --max-tiles reach the workers.
         grid = createGridSearch(config, lon, lat)
         grid.search()
         mkdir(dirname(outfile))
-        grid.write(outfile)
+        # Atomic write: a crash can't leave a truncated output behind
+        grid.write(tmpfile)
+        os.replace(tmpfile, outfile)
         after = _cache_snapshot(config)
         if before is not None:
             for k in ('hits', 'misses', 'bytes_read', 'rows_read', 'read_time'):
                 rec[k] = after[k] - before[k]
     except Exception as e:
-        import traceback
         logger.error("Pixel %i failed:\n%s" % (pix, traceback.format_exc()))
         rec['status'] = 'failed'
         rec['error'] = '%s: %s' % (type(e).__name__, e)
+        if exists(tmpfile):
+            try: os.remove(tmpfile)
+            except OSError: pass
     rec['runtime_s'] = time.time() - t0
+    _append_stats(rec)
     return rec
 
 
+def scan_chunk(pixels):
+    """ Scan a contiguous chunk of pixels in this worker; returns the records. """
+    return [scan_pixel(pix) for pix in pixels]
+
+
+def _init_worker():
+    # Let the parent handle Ctrl-C; workers are cleaned up by the executor.
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
+
+
+def _make_pool(n_jobs, max_tasks_per_child=None):
+    kwargs = dict(max_workers=n_jobs, mp_context=mp.get_context('fork'),
+                  initializer=_init_worker)
+    if max_tasks_per_child:
+        try:
+            return ProcessPoolExecutor(max_tasks_per_child=max_tasks_per_child, **kwargs)
+        except TypeError:  # python < 3.11
+            logger.warning("max_tasks_per_child requires python >= 3.11; ignored")
+    return ProcessPoolExecutor(**kwargs)
+
+
+def _open_stats(stats_file, resume):
+    """ Create the stats file with a header unless resuming an existing one. """
+    if not stats_file:
+        return
+    mkdir(dirname(os.path.abspath(stats_file)))
+    if resume and exists(stats_file) and os.path.getsize(stats_file) > 0:
+        logger.info("Appending to existing stats file %s" % stats_file)
+        return
+    with open(stats_file, 'w', newline='') as f:
+        csv.DictWriter(f, fieldnames=STAT_FIELDS).writeheader()
+
+
 def run_scan(configfile, pixels, n_jobs=1, chunksize=None, force=False,
-             max_tiles=None, stats_file=None):
-    """ Scan `pixels` with n_jobs workers. Returns list of per-pixel records. """
+             max_tiles=None, stats_file=None, max_restarts=3,
+             max_tasks_per_child=None):
+    """ Scan `pixels` with n_jobs workers. Returns the list of per-pixel records.
+
+    Parameters
+    ----------
+    configfile : config file (or Config/dict)
+    pixels     : RING likelihood pixel indices
+    n_jobs     : worker processes (1 = serial in-process; <0 = memory-limited CPU count)
+    chunksize  : pixels per task (default npix // (4*n_jobs))
+    force      : re-run pixels whose output exists
+    max_tiles  : override catalog.hats.max_tiles
+    stats_file : CSV appended per pixel (kept when resuming)
+    max_restarts : pool restarts allowed after a worker dies
+    max_tasks_per_child : recycle workers after this many chunks (python >= 3.11)
+    """
     config = ugali.utils.config.Config(configfile)
     if max_tiles is not None:
         if 'hats' not in (config['catalog'] or {}):
@@ -132,47 +247,70 @@ def run_scan(configfile, pixels, n_jobs=1, chunksize=None, force=False,
         else:
             config['catalog']['hats']['max_tiles'] = int(max_tiles)
     nside = config['coords']['nside_likelihood']
-    if n_jobs is None or n_jobs < 0:
-        n_jobs = os.cpu_count() or 1
 
     pixels = sort_nested(nside, pixels)
     npix = len(pixels)
+    n_jobs = default_n_jobs(n_jobs)
     n_jobs = max(1, min(n_jobs, npix)) if npix else 1
     if chunksize is None:
         chunksize = max(1, npix // (n_jobs * 4))
 
     for var in ('OMP_NUM_THREADS', 'OPENBLAS_NUM_THREADS', 'MKL_NUM_THREADS'):
         os.environ.setdefault(var, '1')
-    _STATE.update(configfile=configfile, config=config, nside=nside, force=force)
+    _open_stats(stats_file, resume=not force)
+    _STATE.update(config=config, nside=nside, force=force, stats_file=stats_file,
+                  lock=mp.get_context('fork').Lock() if n_jobs > 1 else None)
 
-    logger.info("Scanning %i pixels with %i worker(s), chunksize=%i" % (npix, n_jobs, chunksize))
+    ndone = int(np.sum([exists(_outfile(config, p)) for p in pixels])) if not force else 0
+    logger.info("Scanning %i pixels (%i already done) with %i worker(s), chunksize=%i"
+                % (npix, ndone, n_jobs, chunksize))
     t0 = time.time()
     records = []
-    if n_jobs == 1:
-        it = map(scan_pixel, pixels)
-        pool = None
-    else:
-        pool = mp.get_context('fork').Pool(n_jobs)
-        it = pool.imap_unordered(scan_pixel, pixels, chunksize=chunksize)
-    try:
-        for i, rec in enumerate(it, 1):
-            records.append(rec)
-            logger.info("[%i/%i] pix=%i %s %.1fs (hits=%i misses=%i) elapsed=%.0fs" % (
-                i, npix, rec['pix'], rec['status'], rec['runtime_s'],
-                rec['hits'], rec['misses'], time.time() - t0))
-    finally:
-        if pool is not None:
-            pool.close(); pool.join()
-    total = time.time() - t0
 
-    if stats_file:
-        mkdir(dirname(os.path.abspath(stats_file)))
-        with open(stats_file, 'w', newline='') as f:
-            w = csv.DictWriter(f, fieldnames=STAT_FIELDS)
-            w.writeheader()
-            for r in sorted(records, key=lambda r: r['pix']):
-                w.writerow(r)
-        logger.info("Wrote stats to %s" % stats_file)
+    def report(rec, i):
+        logger.info("[%i/%i] pix=%i %s %.1fs (hits=%i misses=%i) elapsed=%.0fs" % (
+            i, npix, rec['pix'], rec['status'], rec['runtime_s'],
+            rec['hits'], rec['misses'], time.time() - t0))
+
+    if n_jobs == 1:
+        for i, pix in enumerate(pixels, 1):
+            rec = scan_pixel(pix)
+            records.append(rec)
+            report(rec, i)
+    else:
+        chunks = [pixels[i:i + chunksize] for i in range(0, npix, chunksize)]
+        pending = list(range(len(chunks)))
+        restarts = 0
+        while pending:
+            pool = _make_pool(n_jobs, max_tasks_per_child)
+            futures = {pool.submit(scan_chunk, chunks[i]): i for i in pending}
+            try:
+                while futures:
+                    done, _ = wait(futures, return_when=FIRST_COMPLETED)
+                    for fut in done:
+                        i = futures.pop(fut)
+                        recs = fut.result()   # raises BrokenProcessPool if a worker died
+                        records.extend(recs)
+                        pending.remove(i)
+                        for rec in recs:
+                            report(rec, len(records))
+                pool.shutdown(wait=True)
+            except BrokenProcessPool:
+                pool.shutdown(wait=False)
+                restarts += 1
+                if restarts > max_restarts:
+                    logger.error("A worker died %i times; giving up. Re-run to resume "
+                                 "(%i chunks unfinished)." % (restarts, len(pending)))
+                    break
+                logger.error("A worker died (OOM/segfault?); restarting the pool "
+                             "(%i/%i) and resubmitting %i unfinished chunks"
+                             % (restarts, max_restarts, len(pending)))
+                time.sleep(5)
+            except KeyboardInterrupt:
+                logger.warning("Interrupted; cancelling remaining work (re-run to resume)")
+                pool.shutdown(wait=False, cancel_futures=True)
+                raise
+    total = time.time() - t0
 
     summarize(records, total)
     return records
@@ -206,7 +344,7 @@ if __name__ == "__main__":
     parser.add_argument('--pixels', nargs='+', type=int, default=None,
                         help='Explicit likelihood pixel indices (RING).')
     parser.add_argument('-n', '--n-jobs', type=int, default=1,
-                        help='Number of worker processes (-1 = all CPUs).')
+                        help='Worker processes (-1 = all CPUs, limited by memory).')
     parser.add_argument('--chunksize', type=int, default=None,
                         help='Pixels per task (default npix//(4*n_jobs)).')
     parser.add_argument('--max-tiles', type=int, default=None,
@@ -214,7 +352,11 @@ if __name__ == "__main__":
     parser.add_argument('-f', '--force', action='store_true',
                         help='Re-run pixels whose output already exists.')
     parser.add_argument('--stats-file', default=None,
-                        help='Write per-pixel stats CSV here.')
+                        help='Per-pixel stats CSV, appended as pixels finish.')
+    parser.add_argument('--max-restarts', type=int, default=3,
+                        help='Pool restarts allowed after a worker dies.')
+    parser.add_argument('--max-tasks-per-child', type=int, default=None,
+                        help='Recycle a worker after this many chunks (python >= 3.11).')
     opts = parser.parse_args()
 
     pixels = select_pixels(opts.config, coords=opts.coords, pixels=opts.pixels,
@@ -228,5 +370,7 @@ if __name__ == "__main__":
         logger.warning("No pixels to scan.")
         sys.exit(0)
     recs = run_scan(opts.config, pixels, n_jobs=opts.n_jobs, chunksize=opts.chunksize,
-                    force=opts.force, max_tiles=opts.max_tiles, stats_file=opts.stats_file)
-    sys.exit(1 if any(r['status'] == 'failed' for r in recs) else 0)
+                    force=opts.force, max_tiles=opts.max_tiles, stats_file=opts.stats_file,
+                    max_restarts=opts.max_restarts, max_tasks_per_child=opts.max_tasks_per_child)
+    nfail = sum(r['status'] == 'failed' for r in recs)
+    sys.exit(1 if (nfail or len(recs) < len(pixels)) else 0)
