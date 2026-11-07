@@ -13,6 +13,12 @@ test_reference_scan
     that run and the matching isochrones, so it is skipped unless the
     reference directory exists (UGALI_DES_REFDIR; UGALI_DES_PIXELS
     selects the nside=256 pixels, default 639648; ~45 s per pixel).
+
+Note on exactness: the references were produced with numpy 1.26. With
+numpy 1.x (any tested scipy/healpy/python version) the scans reproduce
+them bit-for-bit; with numpy 2.x both the FITS and HATS paths differ
+from them by up to the richness-fit tolerance (|dlogL| <~ 0.05, 1e-5
+typically) while remaining identical to each other.
 """
 import os
 import sys
