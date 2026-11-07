@@ -57,6 +57,13 @@ class LogLikelihood(object):
         self.spatial_only = self.config['likelihood'].get('spatial_only',False)
         self.color_only   = self.config['likelihood'].get('color_only',False)
 
+        # Memoization of the spatial signal term (independent of the
+        # distance modulus): keyed by the kernel parameters, so that the
+        # grid search does not recompute it for every distance modulus.
+        self.cache_spatial = self.config['likelihood'].get('cache_spatial',True)
+        self.spatial_cache_size = self.config['likelihood'].get('spatial_cache_size',1024)
+        self._spatial_cache = odict()
+
         if self.spatial_only and self.color_only:
             msg = "Both 'spatial_only' and 'color_only' set"
             logger.error(msg)
@@ -154,7 +161,7 @@ class LogLikelihood(object):
             self.observable_fraction = self.calc_observable_fraction(self.source.distance_modulus)
             self.u_color = self.calc_signal_color(self.source.distance_modulus)
         if self.source.get_sync('kernel'):
-            self.u_spatial = self.calc_signal_spatial()
+            self.u_spatial = self.calc_signal_spatial_cached()
 
         # Combined object-by-object signal probability
         self._u = self.u_spatial * self.u_color
@@ -209,6 +216,7 @@ class LogLikelihood(object):
         # Set the default catalog
         #logger.info("Using interior ROI for likelihood calculation")
         self.catalog = self.catalog_interior
+        self.clear_spatial_cache()
         #self.pixel_roi_cut = self.roi.pixel_interior_cut
 
     def calc_backgroundCMD(self):
@@ -368,6 +376,48 @@ class LogLikelihood(object):
         
         # Spatial component of signal probability
         u_spatial = self.surface_intensity_object
+        return u_spatial
+
+    def spatial_cache_key(self):
+        """Key identifying the spatial signal term: the kernel model and
+        its parameter values, plus the catalog and ROI it is evaluated on."""
+        params = tuple((k,float(v.value)) for k,v in self.kernel.params.items())
+        return (self.kernel.name, params,
+                id(self.catalog), len(self.catalog), id(self.roi))
+
+    def clear_spatial_cache(self):
+        if hasattr(self,'_spatial_cache'):
+            self._spatial_cache.clear()
+
+    def calc_signal_spatial_cached(self):
+        """
+        Memoized `calc_signal_spatial`. The spatial term depends only
+        on the kernel (position, extension, shape), not on the distance
+        modulus, but the grid search sets the kernel for every
+        (pixel, extension) at each modulus; caching the result keyed by
+        the kernel parameters avoids recomputing it for each modulus.
+        The cached values are exactly those `calc_signal_spatial` would
+        return (identical inputs), so results are unchanged. Disable
+        with `likelihood: cache_spatial: False`.
+
+        Returns:
+        --------
+        u_spatial : array of spatial probabilities per object
+        """
+        if not getattr(self,'cache_spatial',False):
+            return self.calc_signal_spatial()
+
+        key = self.spatial_cache_key()
+        hit = self._spatial_cache.get(key)
+        if hit is not None:
+            u_spatial, self.surface_intensity_sparse, self.surface_intensity_object = hit
+            return u_spatial
+
+        u_spatial = self.calc_signal_spatial()
+        if len(self._spatial_cache) >= self.spatial_cache_size:
+            self._spatial_cache.clear()
+        self._spatial_cache[key] = (u_spatial, self.surface_intensity_sparse,
+                                    self.surface_intensity_object)
         return u_spatial
 
     ############################################################################
