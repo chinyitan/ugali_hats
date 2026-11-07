@@ -362,7 +362,14 @@ class EllipticalPlummer(EllipticalKernel):
 
     def _cache(self, name=None):
         if name in [None,'extension','ellipticity','truncate']:
-            self._norm = 1./self.integrate() * 1./self.jacobian
+            # The normalization only depends on these parameters; the
+            # grid search cycles through a few extension values for
+            # every pixel and distance modulus, so memoize the integral.
+            key = (float(self.extension), float(self.ellipticity), float(self.truncate))
+            cache = self.__dict__.setdefault('_norm_cache', {})
+            if key not in cache:
+                cache[key] = 1./self.integrate() * 1./self.jacobian
+            self._norm = cache[key]
         else:
             return
 
@@ -407,7 +414,11 @@ class EllipticalKing(EllipticalKernel):
 
     def _cache(self, name=None):
         if name in [None,'extension','ellipticity','truncate']:
-            self._norm = 1./self.integrate()
+            key = (float(self.extension), float(self.ellipticity), float(self.truncate))
+            cache = self.__dict__.setdefault('_norm_cache', {})
+            if key not in cache:
+                cache[key] = 1./self.integrate()
+            self._norm = cache[key]
         else:
             return
 

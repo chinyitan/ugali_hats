@@ -156,9 +156,10 @@ python ugali/analysis/scan_parallel.py config.yaml --hpxlist pixels.txt -n -1
 ```
 The spatial signal term of the likelihood does not depend on the distance
 modulus, so `LogLikelihood` memoizes it per kernel position/extension during
-the grid search (`likelihood: cache_spatial: True`, default); this halves the
-per-pixel scan time with identical results. Set `cache_spatial: False` to
-disable it.
+the grid search (`likelihood: cache_spatial: True`, default), and the Plummer
+and King kernels memoize their normalization integral per extension. Together
+these reduce the per-pixel scan time by ~3x with identical results. Set
+`cache_spatial: False` to disable the likelihood cache.
 
 See `notebooks/hats_io_validation.ipynb` for the validation against the FITS
 path and timings, and `tests/test_des_scan.py` / `tests/test_hats_catalog.py`.
