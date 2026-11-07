@@ -139,8 +139,12 @@ catalog:
 Partitions are read with `pyarrow` through a least-recently-used cache
 (`ugali.observation.hats_catalog`), so neighbouring ROIs share IO; the
 selection cut is applied per partition before caching. The rows loaded for a
-ROI are the same as those the FITS path reads, so results are identical. The
-mask files are still read from `mask: dirname`.
+ROI are the same as those the FITS path reads, so results are identical to
+float32 precision; because the rows arrive in a different order, the
+per-object likelihood sum can differ in its last double-precision bits, which
+shows up as a 1-ulp change of LOG_LIKELIHOOD in a few percent of pixels where
+TS < 1e-4 (5 of 704 pixels in the DES Y6 reference region). The mask files
+are still read from `mask: dirname`.
 
 `ugali/analysis/scan_parallel.py` runs the likelihood scan for many pixels on
 one machine with a pool of long-lived workers (pixels are sorted by NESTED
