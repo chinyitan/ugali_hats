@@ -318,20 +318,20 @@ def get_reader(config):
     if hcfg is None:
         raise ValueError("Config has no 'catalog: hats:' block")
     path = os.path.expandvars(hcfg['path'])
-    columns = hcfg.get('columns') or default_columns(config)
-    # Columns that may not exist in the catalog (e.g. MC_SOURCE_ID) are
-    # added by Catalog._defineVariables; drop them here.
-    import pyarrow.parquet as pq
-    orders, pixels = read_partition_info(path)
-    schema = pq.ParquetFile(tile_path(path, orders[0], pixels[0])).schema_arrow
-    missing = [c for c in columns if c not in schema.names]
-    if missing:
-        logger.warning("Columns not in HATS catalog (ignored): %s" % missing)
-        columns = [c for c in columns if c in schema.names]
-    key = (path, tuple(columns), config['catalog'].get('selection') or None,
+    columns = tuple(hcfg.get('columns') or default_columns(config))
+    key = (path, columns, config['catalog'].get('selection') or None,
            hcfg.get('max_tiles', 64))
     if key not in _READERS:
-        reader = HatsCatalogReader(path, columns=columns, selection=key[2], max_tiles=key[3])
+        # Columns that may not exist in the catalog (e.g. MC_SOURCE_ID) are
+        # added by Catalog._defineVariables; drop them here.
+        import pyarrow.parquet as pq
+        orders, pixels = read_partition_info(path)
+        schema = pq.ParquetFile(tile_path(path, orders[0], pixels[0])).schema_arrow
+        missing = [c for c in columns if c not in schema.names]
+        if missing:
+            logger.warning("Columns not in HATS catalog (ignored): %s" % missing)
+        use = [c for c in columns if c in schema.names]
+        reader = HatsCatalogReader(path, columns=use, selection=key[2], max_tiles=key[3])
         reader.lon_field = config['catalog']['lon_field']
         reader.lat_field = config['catalog']['lat_field']
         _READERS[key] = reader
