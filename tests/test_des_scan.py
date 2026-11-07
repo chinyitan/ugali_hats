@@ -36,7 +36,7 @@ REF_PIXELS = [int(p) for p in os.environ.get('UGALI_DES_PIXELS', '639648').split
 IGNORE_KEYS = {'DATE', 'CHECKSUM', 'DATASUM', 'COMMENT', 'HISTORY'}
 
 
-def run_scan(workdir, pix, outfile, ugalidir=None):
+def run_scan(workdir, pix, outfile, ugalidir=None, config='config.yaml'):
     """Run scan.py in `workdir` (which must hold config.yaml) as a subprocess.
 
     The isochrone directory is read from UGALIDIR when ugali is
@@ -45,7 +45,7 @@ def run_scan(workdir, pix, outfile, ugalidir=None):
     env = dict(os.environ, OMP_NUM_THREADS='1', MKL_NUM_THREADS='1', OPENBLAS_NUM_THREADS='1')
     if ugalidir is not None:
         env['UGALIDIR'] = ugalidir
-    cmd = [sys.executable, ugali.analysis.scan.__file__, 'config.yaml', str(outfile),
+    cmd = [sys.executable, ugali.analysis.scan.__file__, config, str(outfile),
            '--hpx', str(NSIDE), str(pix)]
     subprocess.check_call(cmd, cwd=str(workdir), env=env)
 
@@ -82,8 +82,8 @@ def compare_fits(ref, new):
     return diffs
 
 
-def test_fixture_scan(tmp_path):
-    """Scan the DES Y6 fixture pixel and compare with the stored reference."""
+def _fixture_scan(tmp_path, config):
+    """Scan the DES Y6 fixture pixel with `config` and compare with the stored reference."""
     # Work on a copy so the scan's output directories never land in the repo
     workdir = tmp_path / 'desy6'
     shutil.copytree(FIXTURE, workdir)
@@ -91,11 +91,22 @@ def test_fixture_scan(tmp_path):
     outfile = workdir / 'out' / ('scan_%08i_cel.fits' % FIXTURE_PIX)
     outfile.parent.mkdir()
 
-    run_scan(workdir, FIXTURE_PIX, outfile, ugalidir=str(workdir))
+    run_scan(workdir, FIXTURE_PIX, outfile, ugalidir=str(workdir), config=config)
     assert outfile.exists()
 
     diffs = compare_fits(str(reffile), str(outfile))
     assert not diffs, "fixture scan differs from reference:\n  " + "\n  ".join(diffs)
+
+
+def test_fixture_scan(tmp_path):
+    """Scan the DES Y6 fixture pixel (FITS catalog) and compare with the stored reference."""
+    _fixture_scan(tmp_path, 'config.yaml')
+
+
+def test_fixture_scan_hats(tmp_path):
+    """Same scan reading the catalog from the HATS copy (make_hats_fixture.py)."""
+    pytest.importorskip('pyarrow')
+    _fixture_scan(tmp_path, 'config_hats.yaml')
 
 
 @pytest.mark.skipif(not os.path.exists(os.path.join(REF_SCANDIR, 'config.yaml')),

@@ -1,0 +1,195 @@
+# DES Y6 single-pixel test fixture (see make_fixture.py).
+# Derived from the scan-v0 config of Chin-Yi Tan's DES Y6 run;
+# only the sections used by ugali/analysis/scan.py are meaningful.
+output:
+  likedir    : ./scan-v0
+  mergedir   : ./merge-v0
+  searchdir  : ./search-v0
+  mcmcdir    : ./mcmc_v0
+  simdir     : ./sims-v0
+  resultdir  : ./results
+  plotdir    : ./plots-v0
+  likefile   : "scan_%08i_%s.fits"
+  mergefile  : "merged_scan_%02d.fits"
+  roifile    :  merged_roi.fits
+  labelfile  :  merged_labels.fits
+  objectfile :  ugali_objects.fits
+  assocfile  :  ugali_assocs.fits
+  candfile   :  ugali_candidates.fits
+  mcmcfile   : "%s_mcmc.npy"
+  simfile    : "sims_%04i.fits"
+
+coords:
+  nside_merge     : 2      # Size of merged likelihood pixels
+  nside_catalog   : 32     # Size of patches for catalog binning
+  nside_mask      : 64     # Size of patches for mask creation (Not use when using split but enforced by _validate)
+  nside_likelihood: 256    # Size of target pixel
+  nside_pixel     : 4096   # Size of pixels within target region
+  roi_radius      : 2.0    # Outer radius of background annulus
+  roi_radius_annulus: 0.5  # Inner radius of background annulus
+  roi_radius_interior: 0.5 # Radius of interior region for likelihood analysis
+  coordsys : &coordsys cel # Coordinate system ['CEL','GAL']
+  proj_type: ait
+  
+catalog:
+  #infile: None
+  hats:
+    path: ./hats/desy6_fixture
+    max_tiles: 16
+  lon_field: RA
+  lat_field: DEC
+  # Color always defined as mag_1 - mag_2
+  objid_field       : COADD_OBJECT_ID
+  mag_1_band        : &band1 g
+  mag_1_field       : PSF_MAG_APER_8_G_CORRECTED
+  mag_err_1_field   : PSF_MAG_ERR_APER_8_G
+  mag_2_band        : &band2 r
+  mag_2_field       : PSF_MAG_APER_8_R_CORRECTED
+  mag_err_2_field   : PSF_MAG_ERR_APER_8_R
+  # True = band 1 is detection band; False = band 2 is detection band
+  band_1_detection  : &detection True
+  mc_source_id_field: MC_SOURCE_ID
+  #selection         : "((self.data['FLAG_FOREGROUND'] & 16) == 0)"
+  selection         : "(self.data['FLAGS_GOLD'] == 0 ) &  (self.data['EXT_XGB'] >= 0 ) & ( self.data['EXT_XGB'] <= 2 )"
+
+data: 
+  survey : des
+  release: desy6
+  footprint: /home/s1/chinyi/80bdata/mw_census/desy6/data/y6a2_decasu_griz_fracdet_n4096.fits
+
+maglim:
+  dirname    : /home/s1/chinyi/80bdata/mw_census/desy6/data/
+  filename_1 : "y6a2_decasu_g_maglim_wmean_n4096.fits"
+  filename_2 : "y6a2_decasu_r_maglim_wmean_n4096.fits"  
+
+mask:
+  dirname    : ./mask
+  basename_1 : "maglim_g_hpx%05i.fits"
+  basename_2 : "maglim_r_hpx%05i.fits"
+  minimum_solid_angle: 0.1 # deg^2
+
+
+color:
+  min   : &cmin -0.5
+  max   : &cmax 1.0 # 1.0
+  n_bins: &cbins 12  # 15
+ 
+mag:
+  min   : &mmin  16    # 18
+  max   : &mmax  25.0  # 25
+  n_bins: &mbins 100 # 0.1, 0.02
+
+# DEPRECATED?: ADW 2017-09-22
+binning: 
+  ###type: [min, max, nbins]
+  color  : [ *cmin, *cmax, *cbins]
+  mag    : [ *mmin, *mmax, *mbins] 
+  age    : [     1,  13.5, 125] # Age (Gyr)   [max a=13.5]
+  z      : [0.0001,  0.01,  32] # Metallicity [max z=0.07]
+ 
+likelihood:
+  #delta_mag: 0.01 # 1.e-3 
+  delta_mag: 0.01 # 1.e-3 
+
+
+# Default batch queue options
+# https://confluence.slac.stanford.edu/x/moNdCw
+batch: &batch
+  local: {}
+  # This works to get 4GB on the general queues
+  short     : &short  {"W":"0:29", "n":4, "R":"span[hosts=1]"}
+  medium    : &medium {"W":"8:00", "n":8, "R":"span[hosts=1]"}
+  # Fermilab Condor test
+  condor    : &condor {"n": 50}
+  # default queue
+  default   : medium
+  max_jobs  : 100
+  chunk     : 25
+  
+scan:
+  script : ./ugali/analysis/scan.py
+  distance_modulus_array: [17.0, 19.0, 21.0]
+  extension_array: [0.02, 0.07, 0.15]
+  #extension_array: [0.07]
+  full_pdf: False
+  color_lut_infile: null
+  source:
+    kernel:
+      name: RadialPlummer
+      r_h: 0.07
+    isochrone:
+       name: CompositeIsochrone
+       isochrones:
+         - {name: Bressan2012, age: 10.0, z: 0.0001}
+         - {name: Bressan2012, age: 10.0, z: 0.0002}
+         - {name: Bressan2012, age: 12.0, z: 0.0001}
+         - {name: Bressan2012, age: 12.0, z: 0.0002}
+       weights: [0.25,0.25,0.25,0.25]
+       band_1 : *band1
+       band_2 : *band2
+       band_1_detection : *detection
+  batch:
+    # default queue name
+    default   : medium
+    # Each node has 4 GB memory
+    # This works to get 8GB on the general queues
+    short     : {"W":"0:59", "n":4, "R":"span[hosts=1]"}  # 16 GB
+    medium    : {"W":"8:00", "n":8, "R":"span[hosts=1]"}  # 32 GB
+    bulletmpi : {"W":"12:00", "n":16} # 64 GB
+    condor    : {"n": 30}
+    max_jobs  : 30
+    chunk     : 25
+    
+search:
+  obj_threshold  : 10  # TS threshold for object selection
+  cand_threshold : 25  # TS threshold for candidate selection
+  xsize    : 1.0e+4
+  minpix   : 1
+  catalogs: [ [ExtraDwarfs, McConnachie15],                           # ASSOC1
+              [Rykoff14, Harris96, Corwen04, Nilson73,                # ASSOC2
+              Webbink85, Kharchenko13, WEBDA14, ExtraClusters]
+              ]
+  proximity: 0.1 # deg
+  batch: *batch
+    
+
+mcmc:
+  script  : ./ugali/analysis/mcmc.py
+  srcmdl  : 'srcmdl.yaml'
+  nsamples: 5000
+  nwalkers: 20
+  nthreads: 15
+  nburn   : 1000
+  nchunk  : 250
+  
+results:
+  martin  : 100
+  nburn   : 10
+  alpha   : 0.10
+  
+simulate:
+  script  : ./ugali/simulation/analyzer.py
+  dirname : /home/s1/chinyi/80bdata/mw_census/desy6/create_sims/v1_des/
+  popfile : sim_population_v1_des_mc_source_id_0000001-0100000.fits
+  catfile : sim_catalog_v1_des_mc_source_id_*.fits
+  save    : 1
+  #kernel    : null # default to use 'kernel' section
+  #isochrone : null # default to use 'isochrone' section
+  #isochrone:
+  #  name: Bressan2012
+  #  age: 12.0 
+  #  z: 0.0001
+  #  distance_modulus : 17.0
+  #  band_1 : *band1
+  #  band_2 : *band2
+  #  band_1_detection : *detection
+  #batch  : *batch
+  batch:
+    short     : {"W":"4:00", "n":4, "R":"span[hosts=1]"}
+    #medium    : {"W":"2:00", "n":2, "R":"span[hosts=1]"} # quick run
+    #medium    : {"W":"4:00", "n":4, "R":"span[hosts=1]"} # cover all jobs
+    medium    : {"W":"8:00", "n":8, "R":"span[hosts=1]"} # cover all jobs
+    long      : {"W":"24:00", "n":8, "R":"span[hosts=1]"} # cover all jobs
+    max_jobs  : 30  
+  
+
