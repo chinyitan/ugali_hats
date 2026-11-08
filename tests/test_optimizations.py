@@ -28,11 +28,13 @@ NSIDE = 256
 FIXTURE_PIX = 639648
 
 
-def make_grid(**likelihood):
+def make_grid(scan=None, **likelihood):
     lon, lat = pix2ang(NSIDE, FIXTURE_PIX)
     cfg = Config(CONFIG)
     for k, v in likelihood.items():
         cfg['likelihood'][k] = v
+    for k, v in (scan or {}).items():
+        cfg['scan'][k] = v
     return createGridSearch(cfg, lon, lat)
 
 
@@ -131,18 +133,34 @@ def test_cached_spatial_hit_matches_original(grid, loglike):
 
 
 def test_full_scan_all_optimizations_off_identical():
-    """Whole grid search with cache_spatial and fast_richness off gives
-    arrays identical to the default (optimized) run."""
+    """Whole grid search with cache_spatial, fast_richness and batch_pixels
+    off gives arrays identical to the default (optimized) run."""
     outs = []
-    for kw in ({}, dict(cache_spatial=False, fast_richness=False)):
+    for kw in ({}, dict(cache_spatial=False, fast_richness=False, scan=dict(batch_pixels=False))):
         g = make_grid(**kw)
         assert g.loglike.cache_spatial == kw.get('cache_spatial', True)
         assert g.loglike.fast_richness == kw.get('fast_richness', True)
+        assert g.batch_pixels == kw.get('scan', {}).get('batch_pixels', True)
         g.search()
         outs.append([np.array(a) for a in (g.loglike_array, g.richness_array,
                                            g.fraction_observable_array)])
     for a, b in zip(*outs):
         assert np.array_equal(a, b)
+
+
+def test_fit_richness_batch_matches_rows(grid, loglike):
+    """fit_richness_batch over a stack of synced positions equals
+    fit_richness run position by position (bit-exact)."""
+    pts = grid_points(grid)[:6]
+    u, f, expected = [], [], []
+    for pt in pts:
+        set_point(loglike, pt)
+        u.append(np.array(loglike.u)); f.append(loglike.f)
+        ll, rich, _ = loglike.fit_richness()
+        expected.append((ll, rich))
+    ll_b, rich_b = loglike.fit_richness_batch(np.array(u), np.array(f))
+    for i, (ll, rich) in enumerate(expected):
+        assert ll_b[i] == ll and rich_b[i] == rich
 
 
 # -------------------------------------------------- observable fraction
