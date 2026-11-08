@@ -217,14 +217,22 @@ class Config(dict):
             catalog_base = self['catalog']['basename']
             catalog_path = os.path.join(catalog_dir,catalog_base)
 
-        mask_dir    = os.path.expandvars(self['mask']['dirname'])
-        if not os.path.isdir(mask_dir):
-            msg = "Directory does not exist: %s"%mask_dir
-            raise IOError(msg)
-        mask_base_1 = self['mask']['basename_1']
-        mask_base_2 = self['mask']['basename_2']
-        mask_path_1 = os.path.join(mask_dir,mask_base_1)
-        mask_path_2 = os.path.join(mask_dir,mask_base_2)
+        healsparse = self['mask'].get('healsparse')
+        if healsparse:
+            # Masks come from HealSparse depth maps: a pixel exists when
+            # the maps of both bands cover it (see healsparse_mask).
+            mask_dir = None
+            mask_path_1 = 'healsparse:%i'
+            mask_path_2 = 'healsparse:%i'
+        else:
+            mask_dir    = os.path.expandvars(self['mask']['dirname'])
+            if not os.path.isdir(mask_dir):
+                msg = "Directory does not exist: %s"%mask_dir
+                raise IOError(msg)
+            mask_base_1 = self['mask']['basename_1']
+            mask_base_2 = self['mask']['basename_2']
+            mask_path_1 = os.path.join(mask_dir,mask_base_1)
+            mask_path_2 = os.path.join(mask_dir,mask_base_2)
 
         data = np.ma.empty(npix,dtype=[('pix',int), ('catalog',object), 
                                        ('mask_1',object), ('mask_2',object)])
@@ -242,8 +250,13 @@ class Config(dict):
             mask['catalog'] = False
         else:
             mask['catalog'] = ~np.isin(data['catalog'],glob.glob(catalog_dir+'/*'))
-        mask['mask_1']  = ~np.isin(data['mask_1'],glob.glob(mask_dir+'/*'))
-        mask['mask_2']  = ~np.isin(data['mask_2'],glob.glob(mask_dir+'/*'))
+        if healsparse:
+            from ugali.observation.healsparse_mask import covered_pixels
+            mask['mask_1'] = ~covered_pixels(healsparse['maglim_1'],nside_catalog)
+            mask['mask_2'] = ~covered_pixels(healsparse['maglim_2'],nside_catalog)
+        else:
+            mask['mask_1']  = ~np.isin(data['mask_1'],glob.glob(mask_dir+'/*'))
+            mask['mask_2']  = ~np.isin(data['mask_2'],glob.glob(mask_dir+'/*'))
 
         for name in ['catalog','mask_1','mask_2']:
             if np.all(mask[name]): logger.warning("All '%s' files masked"%name)

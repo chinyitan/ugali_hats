@@ -34,11 +34,17 @@ class Mask(object):
     def __init__(self, config, roi):
         self.config = Config(config)
         self.roi = roi
-        filenames = self.config.getFilenames()
-        catalog_pixels = self.roi.getCatalogPixels()
+        healsparse = self.config['mask'].get('healsparse')
+        if healsparse:
+            # Depth maps in HealSparse format (ugali.observation.healsparse_mask)
+            self.mask_1 = HealSparseMaskBand(healsparse,1,self.roi)
+            self.mask_2 = HealSparseMaskBand(healsparse,2,self.roi)
+        else:
+            filenames = self.config.getFilenames()
+            catalog_pixels = self.roi.getCatalogPixels()
 
-        self.mask_1 = MaskBand(filenames['mask_1'][catalog_pixels],self.roi)
-        self.mask_2 = MaskBand(filenames['mask_2'][catalog_pixels],self.roi)
+            self.mask_1 = MaskBand(filenames['mask_1'][catalog_pixels],self.roi)
+            self.mask_2 = MaskBand(filenames['mask_2'][catalog_pixels],self.roi)
         self._fracRoiSparse()
 
         self.minimum_solid_angle = self.config.params['mask']['minimum_solid_angle'] # deg^2
@@ -829,6 +835,21 @@ class MaskBand(object):
         # Explicitly zero the maglim of pixels with fracdet < fracmin
         self.mask_roi_sparse[self.frac_roi_sparse == 0] = 0.0
 
+    def _apply_fractype(self, frac):
+        """Detection fraction of the ROI pixels after the configured fractype/fracmin cut."""
+        fractype = self.config['mask'].get('fractype','binary')
+        fracmin = self.config['mask'].get('fracmin',0.5)
+        if fractype == 'binary':
+            frac = np.where(frac < fracmin, 0.0, 1.0)
+        elif fractype == 'full':
+            frac = np.where(frac < fracmin, 0.0, frac)
+        elif not fractype:
+            pass
+        else:
+            msg = "Unrecognized fractype: %s"%fractype
+            logger.warning(msg)
+        return np.clip(frac,0.0,1.0)
+
     #ADW: Safer and more robust (though slightly slower)
     @property
     def mask_annulus_sparse(self):
@@ -884,6 +905,40 @@ class MaskBand(object):
         Magnitude limit at given image coordinates.
         """
         pass
+
+class HealSparseMaskBand(MaskBand):
+    """
+    Map of limiting magnitude for a single band read from HealSparse
+    depth maps (see ugali.observation.healsparse_mask for the config).
+    Provides the same `mask_roi_sparse` / `frac_roi_sparse` arrays as
+    the file-based MaskBand.
+    """
+
+    def __init__(self, healsparse, band, roi):
+        """
+        Parameters:
+        -----------
+        healsparse : the `mask: healsparse:` config block
+        band : 1 or 2
+        roi : roi object
+        """
+        from ugali.observation import healsparse_mask
+        self.roi = roi
+        self.config = self.roi.config
+        self.nside = self.config['coords']['nside_pixel']
+
+        maglim_files = healsparse['maglim_%i'%band]
+        fracdet_files = healsparse.get('fracdet_%i'%band)
+        maglim,frac = healsparse_mask.band_sparse(
+            maglim_files, self.roi.pixels, self.nside, fracdet_files,
+            reduction=healsparse.get('reduction','mean'),
+            cache_size=healsparse.get('cache_size'))
+
+        self.mask_roi_sparse = maglim
+        self.frac_roi_sparse = self._apply_fractype(frac)
+        # Explicitly zero the maglim of pixels with fracdet < fracmin
+        self.mask_roi_sparse[self.frac_roi_sparse == 0] = 0.0
+
 
 class CoverageBand(object):
     """

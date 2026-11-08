@@ -146,6 +146,26 @@ shows up as a 1-ulp change of LOG_LIKELIHOOD in a few percent of pixels where
 TS < 1e-4 (5 of 704 pixels in the DES Y6 reference region). The mask files
 are still read from `mask: dirname`.
 
+Depth masks can likewise be read from [HealSparse](https://healsparse.readthedocs.io)
+maps instead of the per-pixel mask files, by replacing `dirname`/`basename_*`
+in the `mask` section with:
+```yaml
+mask:
+  healsparse:
+    maglim_1: [/path/g_depth_a.hsp, /path/g_depth_b.hsp]   # band-1 depth maps, in priority order
+    maglim_2: [/path/r_depth_a.hsp, /path/r_depth_b.hsp]
+    # fracdet_1 / fracdet_2: optional detection-fraction maps; by default the
+    # fraction of valid map sub-pixels is used
+    reduction: mean       # how finer map pixels are combined into nside_pixel
+  minimum_solid_angle: 0.1
+```
+Only the coverage pixels an ROI touches are read (through a per-process
+cache), maps finer than `nside_pixel` are degraded over their valid
+sub-pixels, pixel existence and the survey footprint come from the maps'
+coverage and valid pixels (`ugali.observation.healsparse_mask`). A scan with
+maps built from the DES Y6 mask files is bit-identical to the file-based one
+(`tests/test_healsparse_mask.py`).
+
 `ugali/analysis/scan_parallel.py` runs the likelihood scan for many pixels on
 one machine with a pool of long-lived workers (pixels are sorted by NESTED
 index so that neighbours share a worker's cache). It is built for long,
