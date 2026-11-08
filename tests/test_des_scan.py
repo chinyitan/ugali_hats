@@ -14,11 +14,14 @@ test_reference_scan
     reference directory exists (UGALI_DES_REFDIR; UGALI_DES_PIXELS
     selects the nside=256 pixels, default 639648; ~45 s per pixel).
 
-Note on exactness: the references were produced with numpy 1.26. With
-numpy 1.x (any tested scipy/healpy/python version) the scans reproduce
-them bit-for-bit; with numpy 2.x both the FITS and HATS paths differ
-from them by up to the richness-fit tolerance (|dlogL| <~ 0.05, 1e-5
-typically) while remaining identical to each other.
+Note on exactness: the fixture reference was produced with numpy 2.5
+(python 3.14) by the original (pre-optimization) scan code, and the
+fixture tests require a bit-for-bit match. numpy 1.x gives results that
+differ from numpy 2.x by up to the richness-fit tolerance (|dlogL| <~
+0.05 in flat likelihoods, 1e-5 typically; |dTS| < 1e-4 where TS > 10),
+identically for the FITS and HATS paths. Chin-Yi's reference run was made
+with numpy 1.26, so test_reference_scan compares exactly under numpy 1
+and within that tolerance under numpy 2.
 """
 import os
 import sys
@@ -131,5 +134,17 @@ def test_reference_scan(pix, tmp_path):
     run_scan(workdir, pix, outfile)
     assert outfile.exists()
 
-    diffs = compare_fits(reffile, str(outfile))
-    assert not diffs, "scan_%08i_cel.fits differs from reference:\n  " % pix + "\n  ".join(diffs)
+    if int(np.__version__.split('.')[0]) < 2:
+        diffs = compare_fits(reffile, str(outfile))
+        assert not diffs, "scan_%08i_cel.fits differs from reference:\n  " % pix + "\n  ".join(diffs)
+    else:
+        # numpy 2 vs the numpy-1 reference: same candidates, not the same bits
+        import fitsio
+        ref, new = fitsio.read(reffile, ext=1), fitsio.read(str(outfile), ext=1)
+        assert np.array_equal(ref['PIXEL'], new['PIXEL'])
+        ts_ref, ts_new = 2.*ref['LOG_LIKELIHOOD'].astype(float), 2.*new['LOG_LIKELIHOOD'].astype(float)
+        dts = np.abs(ts_ref - ts_new)
+        assert dts.max() < 0.2, "max |dTS| = %.3g" % dts.max()
+        strong = ts_ref > 10
+        assert dts[strong].max(initial=0.) < 1e-3, "max |dTS| at TS>10 = %.3g" % dts[strong].max()
+        assert np.array_equal(ref['FRACTION_OBSERVABLE'], new['FRACTION_OBSERVABLE'])
