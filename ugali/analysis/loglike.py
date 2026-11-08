@@ -302,7 +302,9 @@ class LogLikelihood(object):
         """
         mag_1, mag_2 = self.catalog.mag_1,self.catalog.mag_2
         mag_err_1, mag_err_2 = self.catalog.mag_err_1,self.catalog.mag_err_2
-        u_density = self.isochrone.pdf(mag_1,mag_2,mag_err_1,mag_err_2,distance_modulus,self.delta_mag,mass_steps)
+        # likelihood: color_pdf_sparse: True -> faster, not bit-identical (see IsochroneModel.pdf)
+        sparse = self.config['likelihood'].get('color_pdf_sparse',False)
+        u_density = self.isochrone.pdf(mag_1,mag_2,mag_err_1,mag_err_2,distance_modulus,self.delta_mag,mass_steps,sparse=sparse)
 
         #u_color = u_density * self.delta_mag**2
         u_color = u_density
