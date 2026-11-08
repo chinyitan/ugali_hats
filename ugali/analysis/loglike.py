@@ -567,6 +567,104 @@ class LogLikelihood(object):
         index = np.argmax(loglike)
         return loglike[index], richness[index], parabola
 
+    def fit_richness_batch(self, u, f, atol=1.e-3, maxiter=50):
+        """
+        `fit_richness` for many kernel positions at once.
+
+        Parameters:
+        -----------
+        u : (npos, nobj) signal probabilities, one row per position (what
+            `self.u` is after syncing that position); float64, C-contiguous
+        f : (npos,) observable fractions (`self.f` of each position)
+        atol, maxiter : as in `fit_richness`
+
+        Returns:
+        --------
+        loglike, richness : (npos,) arrays with the values `fit_richness`
+            returns for each position
+
+        Every row goes through exactly the operations of `fit_richness`:
+        the element-wise arithmetic is the same, and numpy reduces a
+        C-contiguous row of a 2D array with the same pairwise summation
+        as a 1D array, so the per-row results are bit-identical. The
+        parabola steps are done per row with the same Parabola class.
+        """
+        u = np.ascontiguousarray(u)
+        f = np.asarray(f, dtype=np.float64)
+        npos = len(f)
+        b = self._b
+        if u.dtype != np.float64 or u.ndim != 2 or (npos and len(b) != u.shape[1]):
+            # Not the configuration the batched arithmetic reproduces
+            loglike = np.zeros(npos); richness = np.zeros(npos)
+            for j in range(npos):
+                self._u, self._f = u[j], f[j]
+                loglike[j], richness[j], _ = self.fit_richness(atol, maxiter)
+            return loglike, richness
+
+        # Same guard conditions as fit_richness, per row
+        skip = np.isnan(u).any(axis=1) | ~np.any(u, axis=1) | (f == 0)
+        if skip.any():
+            logger.warning("Signal probability NaN/zero or observable fraction zero for %i position(s)" % skip.sum())
+        active = np.nonzero(~skip)[0]
+
+        param = None
+        for key,model in self.source.models.items():
+            if 'richness' in model.params:
+                param = model.getp('richness')
+                break
+
+        def evaluate(rows, r):
+            # -1.*log(1-p).sum() - f*r for the given rows at richness r
+            # (r as a float64 array, one value per row)
+            if param is not None:
+                for value in r: param.check_bounds(value)
+            uu = u[rows]                     # fancy indexing -> C-contiguous copy
+            ru = r[:,np.newaxis] * uu
+            p = ru/(ru + b)
+            return -1. * np.log(1.-p).sum(axis=1) - (f[rows] * r)
+
+        loglike_out = np.zeros(npos); richness_out = np.zeros(npos)
+        if len(active) == 0:
+            return loglike_out, richness_out
+
+        # Richness corresponding to 0, 1, and 10 observable stars
+        fa = f[active]
+        rich = [np.zeros(len(active)), 1./fa, 10./fa]
+        logl = [evaluate(active, r) for r in rich]
+        richness = [list(col) for col in np.array(rich).T]   # per row lists
+        loglike  = [list(col) for col in np.array(logl).T]
+
+        found = np.zeros(len(active), dtype=bool)
+        parabolas = [None]*len(active)
+        iteration = 0
+        while not found.all():
+            todo = np.nonzero(~found)[0]
+            newr = np.zeros(len(todo)); needs = np.zeros(len(todo), dtype=bool)
+            for n,i in enumerate(todo):
+                parabola = ugali.utils.parabola.Parabola(np.array(richness[i]), 2.*np.array(loglike[i]))
+                parabolas[i] = parabola
+                if parabola.vertex_x < 0.:
+                    found[i] = True
+                else:
+                    newr[n] = parabola.vertex_x; needs[n] = True
+            if needs.any():
+                rows = todo[needs]
+                vals = evaluate(active[rows], newr[needs])
+                for n,i in enumerate(rows):
+                    richness[i].append(newr[needs][n]); loglike[i].append(vals[n])
+                    if np.fabs(loglike[i][-1] - np.max(loglike[i][0:-1])) < atol:
+                        found[i] = True
+            iteration += 1
+            if iteration > maxiter:
+                logger.warning("Maximum number of iterations reached")
+                break
+
+        for n,i in enumerate(active):
+            ll = np.array(loglike[n]); rr = np.array(richness[n])
+            index = np.argmax(ll)
+            loglike_out[i], richness_out[i] = ll[index], rr[index]
+        return loglike_out, richness_out
+
     def _value_richness(self, richness):
         """
         Log-likelihood at `richness` with all other parameters synced.
