@@ -212,6 +212,52 @@ exactness argument and the full-region verification. The regression
 references in `tests/data/desy6` are made with numpy 2 (numpy 1 differs from
 numpy 2 at the richness-fit tolerance, ~1e-5 in log-likelihood).
 
+One further option is not bit-exact: `likelihood: color_pdf_sparse: True`
+accumulates the (object, isochrone bin) contributions of the color pdf
+directly in float64 with `np.bincount` instead of summing dense float32
+arrays. The result differs from the dense sum only at the float32 rounding
+level (|dTS| <= 3e-5 on the DELVE test pixels, richness differences <= 1e-4
+relative), but it removes the memory-bound step that dominates large ROIs:
+on DELVE DR3 (nside_pixel 1024, 21 moduli x 3 kernels) the per-pixel time
+fell from 42 s to 4.6 s, and the scan then scales to 96 workers on a
+2x64-core node where the dense path saturates the memory bandwidth at 48.
+With it the full DELVE DR3 footprint (312,736 nside-256 pixels) scans in
+about 3 hours.
+
+#### Further work
+
+Ideas that came out of the DES Y6 / DELVE DR3 runs, roughly in order of
+expected payoff:
+
+* *Share per-object terms between neighbouring ROIs.* The color pdf of an
+  object depends only on the object and the distance modulus, not on the
+  target pixel, and the observable fraction and background density depend
+  only on the mask pixel. With a 2 deg ROI and 0.23 deg target pixels every
+  object is recomputed ~50 times; a per-worker memo keyed on catalog
+  partition and distance modulus (pixels are already scanned in NESTED
+  order) would remove most of the remaining per-pixel cost.
+* *Validate on a known stream.* Before trusting a stream search, check that
+  the scan recovers a stream the survey clearly covers (e.g. Jhelum, Phoenix
+  or ATLAS in DELVE) at the right modulus and kernel size.
+* *A stream-aware peak finder.* `ugali.analysis.search` looks for compact
+  peaks; streams appear as linear ridges in the TS map of one distance
+  modulus, so a Hough or matched-filter pass over the merged per-modulus
+  maps is needed to find them.
+* *Elongated kernels.* The round Plummer kernels used so far are a poor match
+  to 0.1-0.3 deg half-width streams; an `EllipticalPlummer` with ellipticity
+  ~0.9 scanned over a few position angles would be more sensitive at a few
+  times the cost per kernel.
+* *Flag ROIs with a biased background.* In surveys with tile-level
+  incompleteness (DELVE single-epoch g/r tiles detect <50% of the bright
+  objects, which no per-band depth map captures) the annulus background can
+  be badly over-estimated. Besides masking such tiles through an explicit
+  `fracdet` map, the ratio of the interior to annulus bright-object density
+  per target pixel is a cheap post-hoc flag.
+* *A parallel collator.* The stock merge step reads the per-pixel FITS
+  outputs serially, which does not scale to the ~300k files of a full
+  survey; a parallel collation into one table per distance modulus is
+  needed before the search step.
+
 See `notebooks/hats_io_validation.ipynb` for the validation against the FITS
 path and timings, and `tests/test_des_scan.py` / `tests/test_hats_catalog.py`.
 
