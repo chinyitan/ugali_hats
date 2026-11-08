@@ -179,10 +179,16 @@ the original loops (verified on the 704-pixel DES Y6 reference region):
 * the isochrone pdf finds the contributing (object, isochrone bin) pairs
   (a few percent of all pairs) from the magnitude windows instead of building
   dense distance arrays.
-Together these reduce the per-pixel scan time from ~41 s to ~3-5 s (DES Y6,
-numpy 1.26). Set `cache_spatial: False` / `fast_richness: False` to fall back
-to the original code paths for the first two; `tests/test_optimizations.py`
-checks each against the original formula.
+Mask files are read once per process into an LRU cache shared by
+neighbouring ROIs, and the isochrone directory grid is memoized.
+Together these reduce the per-pixel scan time from ~41 s to ~3-4 s (DES Y6).
+Set `cache_spatial: False` / `fast_richness: False` to fall back to the
+original code paths for the first two; `tests/test_optimizations.py` checks
+each step against the original formula, and
+`notebooks/scan_optimizations.ipynb` walks through every change with the
+exactness argument and the full-region verification. The regression
+references in `tests/data/desy6` are made with numpy 2 (numpy 1 differs from
+numpy 2 at the richness-fit tolerance, ~1e-5 in log-likelihood).
 
 See `notebooks/hats_io_validation.ipynb` for the validation against the FITS
 path and timings, and `tests/test_des_scan.py` / `tests/test_hats_catalog.py`.
