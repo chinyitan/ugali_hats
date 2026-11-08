@@ -61,9 +61,17 @@ class Mask(object):
         # Also possible and simple:
         #return np.unique(zip(self.mask_1.mask_roi_sparse,self.mask_2.mask_roi_sparse))
 
-        A = np.vstack([self.mask_1.mask_roi_sparse,self.mask_2.mask_roi_sparse]).T
-        B = A[np.lexsort(A.T[::-1])]
-        return B[np.concatenate(([True],np.any(B[1:]!=B[:-1],axis=1)))]
+        # Memoized on the (identity of the) sparse mask arrays: the
+        # observable fraction asks for this at every distance modulus.
+        key = (id(self.mask_1.mask_roi_sparse), id(self.mask_2.mask_roi_sparse))
+        cache = self.__dict__.setdefault('_mask_roi_unique_cache', {})
+        if cache.get('key') != key:
+            A = np.vstack([self.mask_1.mask_roi_sparse,self.mask_2.mask_roi_sparse]).T
+            B = A[np.lexsort(A.T[::-1])]
+            cache.clear()
+            cache['key'] = key
+            cache['unique'] = B[np.concatenate(([True],np.any(B[1:]!=B[:-1],axis=1)))]
+        return cache['unique']
 
     @property
     def mask_roi_digi(self):
@@ -71,19 +79,24 @@ class Mask(object):
         Get the index of the unique magnitude tuple for each pixel in the ROI.
         """
         # http://stackoverflow.com/q/24205045/#24206440
-        A = np.vstack([self.mask_1.mask_roi_sparse,self.mask_2.mask_roi_sparse]).T
         B = self.mask_roi_unique
+        cache = self.__dict__['_mask_roi_unique_cache'] # filled by mask_roi_unique
+        if 'digi' in cache:
+            return cache['digi']
+
+        A = np.vstack([self.mask_1.mask_roi_sparse,self.mask_2.mask_roi_sparse]).T
 
         AA = np.ascontiguousarray(A)
         BB = np.ascontiguousarray(B)
-         
+
         dt = np.dtype((np.void, AA.dtype.itemsize * AA.shape[1]))
         a = AA.view(dt).ravel()
         b = BB.view(dt).ravel()
-         
+
         idx = np.argsort(b)
         indices = np.searchsorted(b[idx],a)
-        return idx[indices]
+        cache['digi'] = idx[indices]
+        return cache['digi']
 
     @property
     def frac_annulus_sparse(self):

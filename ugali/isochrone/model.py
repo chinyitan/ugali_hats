@@ -542,7 +542,13 @@ class IsochroneModel(Model):
         color = mag_1 - mag_2
 
         # ADW: Only calculate observable fraction for unique mask values
-        mag_1_mask,mag_2_mask = mask.mask_roi_unique.T
+        # ... and only for the unique values that occur in the interior
+        # region, which are the only ones used below. Each unique value
+        # is an independent column of the calculation, so this does not
+        # change the result.
+        digi_interior = mask.mask_roi_digi[mask.roi.pixel_interior_cut]
+        unique_interior, inverse = np.unique(digi_interior, return_inverse=True)
+        mag_1_mask,mag_2_mask = mask.mask_roi_unique[unique_interior].T
 
         # ADW: Restrict mag and color to range of mask with sufficient solid angle
         cmd_cut = ugali.utils.binning.take2D(mask.solid_angle_cmd,color,mag+distance_modulus,
@@ -555,11 +561,17 @@ class IsochroneModel(Model):
         mask_2_cut = (mag_2+distance_modulus)[:,np.newaxis] < mag_2_mask
         mask_cut_repeat = (mask_1_cut & mask_2_cut)
 
-        # Condense back into one per digi
-        observable_fraction = (mass_pdf_cut[:,np.newaxis]*mask_cut_repeat).sum(axis=0)
+        # Condense back into one per digi. This is a masked column-wise
+        # sum, equivalent to (mass_pdf_cut[:,None]*mask_cut_repeat).sum(axis=0)
+        # (adding a zero term leaves a partial sum unchanged, and the
+        # summation order along axis 0 is the same), but it avoids
+        # materializing the n_sample x n_unique float64 product.
+        observable_fraction = np.add.reduce(
+            np.broadcast_to(mass_pdf_cut[:,np.newaxis], mask_cut_repeat.shape),
+            axis=0, where=mask_cut_repeat)
 
-        # Expand to the roi and multiply by coverage fraction
-        return observable_fraction[mask.mask_roi_digi[mask.roi.pixel_interior_cut]] * mask.frac_interior_sparse
+        # Expand to the interior roi and multiply by coverage fraction
+        return observable_fraction[inverse.ravel()] * mask.frac_interior_sparse
 
 
     def observableFractionCDF(self, mask, distance_modulus, mass_min=0.1):
@@ -898,40 +910,61 @@ class IsochroneModel(Model):
         n_catalog = len(mag_1)
         n_isochrone_bins = len(idx_mag_1)
 
-        mag_1 = mag_1.reshape([n_catalog, 1])
-        mag_err_1 = mag_err_1.reshape([n_catalog, 1])
-        mag_2 = mag_2.reshape([n_catalog, 1])
-        mag_err_2 = mag_err_2.reshape([n_catalog, 1])
-
         # Calculate (normalized) distance between each catalog object
         # and isochrone bin. Assume normally distributed photometric
         # uncertainties so that the normalized distance is:
         #   norm_dist = (mag_1 - bins_mag_1)/mag_err_1
+        # Only bins that are < nsigma from the data point contribute
+        # (i.e., where the pdf is ~nonzero): typically a few percent of
+        # the n_catalog x n_isochrone_bins pairs. Rather than evaluating
+        # the dense distance arrays, candidate (object, bin) pairs are
+        # found from the magnitude windows (a strict superset of the
+        # pairs that pass the nsigma cut), and the exact cut and pdf
+        # are evaluated on those pairs with the same element-wise
+        # arithmetic as the dense calculation, so the result is identical.
+        bins_1_lo = bins_mag_1[idx_mag_1]
+        bins_1_hi = bins_mag_1[idx_mag_1+1]
+        bins_2_lo = bins_mag_2[idx_mag_2]
+        bins_2_hi = bins_mag_2[idx_mag_2+1]
 
-        # ADW: Creating the dist arrays is memory intensive.
-        # Can we cut it down (maybe with add.at)?
-        dist_mag_1_hi = (mag_1-bins_mag_1[idx_mag_1])/mag_err_1
-        dist_mag_1_lo = (mag_1-bins_mag_1[idx_mag_1+1])/mag_err_1
+        # The bins come from np.nonzero in row-major order, so bins_1_lo
+        # and bins_1_hi are sorted; the window in mag_1 is a contiguous
+        # range of bins. The margin covers the rounding of the division
+        # in the exact cut below (it only enlarges the candidate set).
+        margin = 1e-4
+        lower = mag_1.astype(np.float64) - nsigma*mag_err_1.astype(np.float64) - margin
+        upper = mag_1.astype(np.float64) + nsigma*mag_err_1.astype(np.float64) + margin
+        start = np.searchsorted(bins_1_hi, lower, 'left')
+        stop  = np.searchsorted(bins_1_lo, upper, 'right')
+        counts = np.clip(stop - start, 0, None)
+        obj = np.repeat(np.arange(n_catalog), counts)
+        bin = (np.arange(counts.sum()) - np.repeat(np.cumsum(counts) - counts, counts)
+               + np.repeat(start, counts))
 
-        dist_mag_2_hi = (mag_2-bins_mag_2[idx_mag_2])/mag_err_2
-        dist_mag_2_lo = (mag_2-bins_mag_2[idx_mag_2+1])/mag_err_2
-         
-        # Only calculate the PDF using bins that are < nsigma from the
-        # data point (i.e., where it is ~nonzero).
-        idx_nonzero_0,idx_nonzero_1 = np.nonzero((dist_mag_1_hi > -nsigma) \
-                                                *(dist_mag_1_lo < nsigma)\
-                                                *(dist_mag_2_hi > -nsigma)\
-                                                *(dist_mag_2_lo < nsigma))
+        # Same window in mag_2 (bins are not sorted in mag_2, so filter)
+        lower = mag_2.astype(np.float64) - nsigma*mag_err_2.astype(np.float64) - margin
+        upper = mag_2.astype(np.float64) + nsigma*mag_err_2.astype(np.float64) + margin
+        sel = (bins_2_lo[bin] < upper[obj]) & (bins_2_hi[bin] > lower[obj])
+        obj, bin = obj[sel], bin[sel]
+
+        # The exact cut (element-wise, identical to the dense expression)
+        dist_mag_1_hi = (mag_1[obj]-bins_1_lo[bin])/mag_err_1[obj]
+        dist_mag_1_lo = (mag_1[obj]-bins_1_hi[bin])/mag_err_1[obj]
+        dist_mag_2_hi = (mag_2[obj]-bins_2_lo[bin])/mag_err_2[obj]
+        dist_mag_2_lo = (mag_2[obj]-bins_2_hi[bin])/mag_err_2[obj]
+        sel = ((dist_mag_1_hi > -nsigma) & (dist_mag_1_lo < nsigma)
+               & (dist_mag_2_hi > -nsigma) & (dist_mag_2_lo < nsigma))
+        idx_nonzero_0, idx_nonzero_1 = obj[sel], bin[sel]
 
         # Now calculate the pdf as the delta of the normalized cdf
         # (more accurate than the point evaluation of the pdf)
         pdf_mag_1 = np.zeros([n_catalog, n_isochrone_bins],dtype=np.float32)
-        pdf_mag_1[idx_nonzero_0,idx_nonzero_1] = norm_cdf(dist_mag_1_hi[idx_nonzero_0,idx_nonzero_1]) \
-            - norm_cdf(dist_mag_1_lo[idx_nonzero_0,idx_nonzero_1])
+        pdf_mag_1[idx_nonzero_0,idx_nonzero_1] = norm_cdf(dist_mag_1_hi[sel]) \
+            - norm_cdf(dist_mag_1_lo[sel])
 
         pdf_mag_2 = np.zeros([n_catalog, n_isochrone_bins],dtype=np.float32)
-        pdf_mag_2[idx_nonzero_0,idx_nonzero_1] = norm_cdf(dist_mag_2_hi[idx_nonzero_0,idx_nonzero_1]) \
-            - norm_cdf(dist_mag_2_lo[idx_nonzero_0,idx_nonzero_1])
+        pdf_mag_2[idx_nonzero_0,idx_nonzero_1] = norm_cdf(dist_mag_2_hi[sel]) \
+            - norm_cdf(dist_mag_2_lo[sel])
 
         # Signal "color probability" (as opposed to "spatial
         # probability", but more accurately "isochrone probability")
