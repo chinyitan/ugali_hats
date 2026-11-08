@@ -253,10 +253,11 @@ expected payoff:
   be badly over-estimated. Besides masking such tiles through an explicit
   `fracdet` map, the ratio of the interior to annulus bright-object density
   per target pixel is a cheap post-hoc flag.
-* *A parallel collator.* The stock merge step reads the per-pixel FITS
-  outputs serially, which does not scale to the ~300k files of a full
-  survey; a parallel collation into one table per distance modulus is
-  needed before the search step.
+* *Collation.* `ugali/analysis/collate.py` reads the per-pixel FITS
+  outputs with a process pool into one `.npz` of (cell, modulus) arrays
+  (313k files in about a minute on 48 workers); the stock serial merge step
+  does not scale to a full survey. The search step still needs to be
+  pointed at the collated arrays.
 
 See `notebooks/hats_io_validation.ipynb` for the validation against the FITS
 path and timings, and `tests/test_des_scan.py` / `tests/test_hats_catalog.py`.
