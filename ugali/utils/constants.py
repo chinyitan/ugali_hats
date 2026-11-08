@@ -160,6 +160,14 @@ MAGERR_PARAMS = dict(
         'i': [ -0.9044, -2.2738, 0.0005], 
         },
 
+    # DELVE DR3 gold: fit to the median PSF_MAG_ERR_APER_8 of stars
+    # (FLAGS_GOLD==0, EXT_XGB<=1) in 0.1 mag bins of maglim-mag, from 40
+    # random HATS partitions and the DR3 healsparse depth maps (2026-11)
+    delve_dr3 = {
+        'g': [ -0.9104, -1.8007, 0.0005],
+        'r': [ -0.9074, -1.9474, 0.0005],
+        },
+
     # This is fit from some curves that Keith made
     ps1_dr1 = {
         'g' : [-0.84967134, -2.27897518,  0.00304501],
