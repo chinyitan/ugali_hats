@@ -158,12 +158,31 @@ limited by available memory (~4 GB per worker):
 python ugali/analysis/scan_parallel.py config.yaml --pixels 639648 640671 -n 4 --stats-file stats.csv
 python ugali/analysis/scan_parallel.py config.yaml --hpxlist pixels.txt -n -1
 ```
-The spatial signal term of the likelihood does not depend on the distance
-modulus, so `LogLikelihood` memoizes it per kernel position/extension during
-the grid search (`likelihood: cache_spatial: True`, default), and the Plummer
-and King kernels memoize their normalization integral per extension. Together
-these reduce the per-pixel scan time by ~3x with identical results. Set
-`cache_spatial: False` to disable the likelihood cache.
+The driver pins every worker to one BLAS/OpenMP thread (a multi-threaded
+BLAS in each of 48 workers was measured 3x slower); set `OMP_NUM_THREADS`
+yourself to override. The stats file records the setup (catalog/mask load)
+and search time of every pixel separately.
+
+Several steps of the grid search are reorganized so that they do strictly
+less work with the same arithmetic, and the outputs are bit-for-bit those of
+the original loops (verified on the 704-pixel DES Y6 reference region):
+* the spatial signal term does not depend on the distance modulus, so
+  `LogLikelihood` memoizes it per kernel position/extension
+  (`likelihood: cache_spatial: True`, default), the kernel radii of a centroid
+  are shared by its extensions, and the Plummer and King kernels memoize their
+  normalization integral per extension;
+* the richness maximization evaluates the likelihood directly from the synced
+  spatial/color terms instead of re-syncing them at every richness
+  (`likelihood: fast_richness: True`, default);
+* the observable fraction is evaluated only for the unique mask values that
+  occur in the interior region, with a masked sum;
+* the isochrone pdf finds the contributing (object, isochrone bin) pairs
+  (a few percent of all pairs) from the magnitude windows instead of building
+  dense distance arrays.
+Together these reduce the per-pixel scan time from ~41 s to ~3-5 s (DES Y6,
+numpy 1.26). Set `cache_spatial: False` / `fast_richness: False` to fall back
+to the original code paths for the first two; `tests/test_optimizations.py`
+checks each against the original formula.
 
 See `notebooks/hats_io_validation.ipynb` for the validation against the FITS
 path and timings, and `tests/test_des_scan.py` / `tests/test_hats_catalog.py`.
