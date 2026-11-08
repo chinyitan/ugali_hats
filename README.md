@@ -173,7 +173,9 @@ the original loops (verified on the 704-pixel DES Y6 reference region):
   normalization integral per extension;
 * the richness maximization evaluates the likelihood directly from the synced
   spatial/color terms instead of re-syncing them at every richness
-  (`likelihood: fast_richness: True`, default);
+  (`likelihood: fast_richness: True`, default), and all target pixels of an
+  extension are fit in one vectorized call (`scan: batch_pixels: True`,
+  default; a C-contiguous row of a 2D array sums exactly like a 1D array);
 * the observable fraction is evaluated only for the unique mask values that
   occur in the interior region, with a masked sum;
 * the isochrone pdf finds the contributing (object, isochrone bin) pairs
