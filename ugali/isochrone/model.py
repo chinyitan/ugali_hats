@@ -966,8 +966,9 @@ class IsochroneModel(Model):
             w = (norm_cdf(dist_mag_1_hi[sel]) - norm_cdf(dist_mag_1_lo[sel])) \
                 * (norm_cdf(dist_mag_2_hi[sel]) - norm_cdf(dist_mag_2_lo[sel])) \
                 * isochrone_pdf[idx_nonzero_1].astype(np.float64)
+            # (bincount returns an integer array when there are no pairs)
             u_color = np.bincount(idx_nonzero_0, weights=w, minlength=n_catalog)
-            u_color /= delta_mag**2
+            u_color = u_color.astype(np.float64) / delta_mag**2
             return u_color.astype(np.float32)
 
         # Now calculate the pdf as the delta of the normalized cdf
