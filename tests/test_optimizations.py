@@ -266,3 +266,17 @@ def test_mask_roi_unique_digi_memoized(loglike):
     assert np.array_equal(d1, d2)
     full = np.vstack([mask.mask_1.mask_roi_sparse, mask.mask_2.mask_roi_sparse]).T
     assert np.array_equal(mask.mask_roi_unique[mask.mask_roi_digi], full)
+
+
+# -------------------------------------------------- sparse color pdf (opt-in, not bit-exact)
+def test_isochrone_pdf_sparse_accumulation_close(loglike):
+    """likelihood: color_pdf_sparse accumulates the same (object, bin)
+    contributions in float64; it must agree with the dense float32 sum to
+    float32 rounding (relative 1e-5 of the largest value)."""
+    iso, cat = loglike.isochrone, loglike.catalog
+    for dm in (17.0, 20.0):
+        dense = iso.pdf(cat.mag_1, cat.mag_2, cat.mag_err_1, cat.mag_err_2, dm, loglike.delta_mag, 10000)
+        sparse = iso.pdf(cat.mag_1, cat.mag_2, cat.mag_err_1, cat.mag_err_2, dm, loglike.delta_mag, 10000, sparse=True)
+        assert dense.shape == sparse.shape and dense.dtype == sparse.dtype
+        assert np.array_equal(dense > 0, sparse > 0)
+        assert np.abs(dense.astype(float) - sparse.astype(float)).max() <= 1e-5 * dense.max()

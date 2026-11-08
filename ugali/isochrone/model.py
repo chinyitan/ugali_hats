@@ -851,8 +851,8 @@ class IsochroneModel(Model):
 
     #import memory_profiler
     #@memory_profiler.profile
-    def pdf(self, mag_1, mag_2, mag_err_1, mag_err_2, 
-            distance_modulus=None, delta_mag=0.03, steps=10000):
+    def pdf(self, mag_1, mag_2, mag_err_1, mag_err_2,
+            distance_modulus=None, delta_mag=0.03, steps=10000, sparse=False):
         """
         Compute isochrone probability for each catalog object.
  
@@ -871,6 +871,11 @@ class IsochroneModel(Model):
         distance_modulus : distance modulus of isochrone
         delta_mag : magnitude binning for evaluating the pdf
         steps : number of isochrone sample points
+        sparse : accumulate the (object, bin) contributions directly in
+            float64 instead of summing dense float32 arrays. Faster and
+            uses far less memory for large ROIs, but not bit-identical to
+            the dense sum (differences at the float32 rounding level,
+            ~1e-7 relative).
 
         Returns:
         --------
@@ -955,6 +960,15 @@ class IsochroneModel(Model):
         sel = ((dist_mag_1_hi > -nsigma) & (dist_mag_1_lo < nsigma)
                & (dist_mag_2_hi > -nsigma) & (dist_mag_2_lo < nsigma))
         idx_nonzero_0, idx_nonzero_1 = obj[sel], bin[sel]
+
+        if sparse:
+            # Direct accumulation over the contributing pairs (see docstring)
+            w = (norm_cdf(dist_mag_1_hi[sel]) - norm_cdf(dist_mag_1_lo[sel])) \
+                * (norm_cdf(dist_mag_2_hi[sel]) - norm_cdf(dist_mag_2_lo[sel])) \
+                * isochrone_pdf[idx_nonzero_1].astype(np.float64)
+            u_color = np.bincount(idx_nonzero_0, weights=w, minlength=n_catalog)
+            u_color /= delta_mag**2
+            return u_color.astype(np.float32)
 
         # Now calculate the pdf as the delta of the normalized cdf
         # (more accurate than the point evaluation of the pdf)
