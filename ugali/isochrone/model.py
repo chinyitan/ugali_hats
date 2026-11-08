@@ -1073,6 +1073,9 @@ class IsochroneModel(Model):
         #return dmag_1,dmag_2
         return np.sqrt(dmag_1**2 + dmag_2**2)
 
+# Process-wide cache of the (age, z) values found in an isochrone directory
+_GRID_CACHE = {}
+
 class Isochrone(IsochroneModel):
     """ Abstract base class for isochrones """
 
@@ -1149,9 +1152,17 @@ class Isochrone(IsochroneModel):
 
     def create_grid(self,abins=None,zbins=None):
         if abins is None and zbins is None:
-            filenames = glob.glob(self.get_dirname()+'/%s_*.dat'%(self._prefix))
-            data = np.array([self.filename2params(f) for f in filenames])
-            if len(data):
+            # The (age, z) grid of an isochrone directory is memoized
+            # process-wide: it is a glob over the whole directory
+            # (tens of thousands of files) at every instantiation.
+            key = (self.get_dirname(), self._prefix)
+            grid = _GRID_CACHE.get(key)
+            if grid is None:
+                filenames = glob.glob(self.get_dirname()+'/%s_*.dat'%(self._prefix))
+                data = np.array([self.filename2params(f) for f in filenames])
+                grid = _GRID_CACHE[key] = (data if len(data) else None)
+            data = grid
+            if data is not None:
                 arange = np.unique(data[:,0])
                 zrange = np.unique(data[:,1])
             else:

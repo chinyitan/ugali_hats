@@ -9,9 +9,11 @@ Functions
 """
 
 import os
+from collections import OrderedDict as odict
 import numpy as np
 import healpy as hp
 import scipy.signal
+import fitsio
 
 import ugali.utils.binning
 import ugali.utils.skymap
@@ -714,6 +716,67 @@ class Mask(object):
 
 ############################################################
 
+# Process-wide cache of sparse mask files (PIXEL, MAGLIM[, FRACDET]),
+# keyed by filename. Neighbouring ROIs read the same catalog-pixel mask
+# files, and each file used to be read twice per band (MAGLIM, FRACDET).
+_MASK_FILE_CACHE = odict()
+MASK_FILE_CACHE_SIZE = 64
+
+def read_mask_file(filename, ext=1):
+    """Return (header, data) of a sparse mask file through the process cache.
+    `data` holds PIXEL, MAGLIM and (when present) FRACDET; treat it as read-only."""
+    entry = _MASK_FILE_CACHE.get(filename)
+    if entry is not None:
+        _MASK_FILE_CACHE.move_to_end(filename)
+        return entry
+    with fitsio.FITS(filename) as fits:
+        header = fits[ext].read_header()
+        columns = [c for c in ('PIXEL','MAGLIM','FRACDET') if c in fits[ext].get_colnames()]
+        data = fits[ext].read(columns=columns)
+    entry = (header, data)
+    _MASK_FILE_CACHE[filename] = entry
+    while len(_MASK_FILE_CACHE) > MASK_FILE_CACHE_SIZE:
+        _MASK_FILE_CACHE.popitem(last=False)
+    return entry
+
+def clear_mask_file_cache():
+    _MASK_FILE_CACHE.clear()
+
+def read_mask_sparse(infiles, column, pixels):
+    """
+    Values of `column` of the sparse mask files at `pixels`, i.e. exactly
+    `healpix.read_partial_map(infiles, column)[2][pixels]` (UNSEEN where a
+    pixel is not in the files), without building the full-sky map and
+    reading the files through the process cache.
+
+    Raises ValueError if the column is not in the files (like fitsio).
+    """
+    infiles = np.atleast_1d(infiles)
+    header, _ = read_mask_file(infiles[0])
+    nside = header['NSIDE']
+    pix, value = [], []
+    for f in infiles:
+        data = read_mask_file(f)[1]
+        if column not in data.dtype.names:
+            raise ValueError("Column '%s' not found in %s" % (column, f))
+        pix.append(data['PIXEL']); value.append(data[column])
+    pix = np.concatenate(pix); value = np.concatenate(value)
+
+    ndupes = len(pix) - len(np.unique(pix))
+    if ndupes > 0:
+        msg = '%i duplicate pixels during load.'%(ndupes)
+        raise Exception(msg)
+
+    pixels = np.asarray(pixels)
+    out = hp.UNSEEN * np.ones(pixels.shape, dtype=value.dtype)
+    if len(pix):
+        order = np.argsort(pix)
+        spix = pix[order]
+        idx = np.minimum(np.searchsorted(spix, pixels), len(spix)-1)
+        found = spix[idx] == pixels
+        out[found] = value[order][idx[found]]
+    return nside, out
+
 class MaskBand(object):
     """
     Map of liming magnitude for a single observing band.
@@ -733,20 +796,17 @@ class MaskBand(object):
         self.roi = roi
         self.config = self.roi.config
 
-        # ADW: It's overkill to make the full map just to slim it
-        # down, but we don't have a great way to go from map pixels to
-        # roi pixels.
-        nside,pixel,maglim = healpix.read_partial_map(infiles,column='MAGLIM')
+        # Sparse maps of pixels in various ROI regions (same values as
+        # healpix.read_partial_map(infiles,'MAGLIM')[2][self.roi.pixels])
+        nside,maglim = read_mask_sparse(infiles,'MAGLIM',self.roi.pixels)
         self.nside = nside
-
-        # Sparse maps of pixels in various ROI regions
-        self.mask_roi_sparse = maglim[self.roi.pixels] 
+        self.mask_roi_sparse = maglim
 
         # Try to get the detection fraction
         self.frac_roi_sparse = (self.mask_roi_sparse > 0)
-        try: 
+        try:
             logger.debug("Reading FRACDET...")
-            nside,pixel,frac=healpix.read_partial_map(infiles,column='FRACDET')
+            nside,frac=read_mask_sparse(infiles,'FRACDET',self.roi.pixels)
             # This clipping might gloss over bugs...
             fractype = self.config['mask'].get('fractype','binary')
             fracmin = self.config['mask'].get('fracmin',0.5)
@@ -760,7 +820,7 @@ class MaskBand(object):
                 msg = "Unrecognized fractype: %s"%fractype
                 logger.warning(msg)
                 
-            self.frac_roi_sparse = np.clip(frac[self.roi.pixels],0.0,1.0)
+            self.frac_roi_sparse = np.clip(frac,0.0,1.0)
         except ValueError as e:
             # No detection fraction present
             msg = "No 'FRACDET' column found in masks; assuming FRACDET = 1.0"
