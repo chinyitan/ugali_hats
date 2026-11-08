@@ -25,6 +25,8 @@ Configuration::
         columns: null   # optional explicit column list (default: the
                         # fields named in the catalog section)
         max_tiles: 64   # LRU size in partitions (None = unbounded)
+        derived:        # optional columns computed per partition with numpy
+          G_DERED: "g_psfMag - 3.64 * ebv"   # (before the selection cut)
       ... the usual catalog keys (lon_field, mag_1_field, selection, ...)
 
 Usage::
@@ -34,6 +36,7 @@ Usage::
     reader.stats                             # hits/misses/bytes/time
 """
 import os
+import re
 import time
 import threading
 from collections import OrderedDict
@@ -67,12 +70,59 @@ class _SelectionData(object):
         self.data = data
 
 
+def pa_types():
+    import pyarrow.types
+    return pyarrow.types
+
+
+_IDENT = re.compile(r'[A-Za-z_][A-Za-z0-9_]*')
+
+
+def derived_inputs(derived):
+    """Identifiers referenced by the ``derived`` expressions (candidate input columns)."""
+    names = []
+    for expr in (derived or {}).values():
+        for n in _IDENT.findall(str(expr)):
+            if n not in names: names.append(n)
+    return names
+
+
+def add_derived(data, derived):
+    """Append columns computed from ``derived`` = {name: expression}.
+
+    Each expression is evaluated with numpy (available as ``np``) and the
+    columns of `data` as variables, in the order given, so later expressions
+    may use earlier derived columns. Returns a new structured array.
+    """
+    if not derived:
+        return data
+    names = list(data.dtype.names)
+    env = {name: data[name] for name in names}
+    new = []
+    for name, expr in derived.items():
+        val = eval(str(expr), {'np': np, '__builtins__': {}}, env)
+        val = np.broadcast_to(np.asarray(val), (len(data),))
+        env[name] = val
+        new.append((name, val))
+    dtype = [(n, data.dtype[n]) for n in names if n not in dict(new)]
+    dtype += [(n, v.dtype) for n, v in new]
+    out = np.empty(len(data), dtype=dtype)
+    for n in names:
+        if n not in dict(new): out[n] = data[n]
+    for n, v in new:
+        out[n] = v
+    return out
+
+
 def table_to_recarray(table):
     """Convert a pyarrow Table to a numpy structured array (native byte order)."""
     arrays, dtype = [], []
     for name in table.column_names:
         col = table.column(name)
-        if col.null_count:
+        if col.null_count and pa_types().is_boolean(col.type):
+            # null flags would become an object array; treat them as False
+            arr = col.fill_null(False).to_numpy(zero_copy_only=False)
+        elif col.null_count:
             arr = col.to_pandas().to_numpy()
         else:
             arr = col.to_numpy(zero_copy_only=False)
@@ -95,10 +145,14 @@ class HatsCatalogReader(object):
     selection : optional ugali-style selection string evaluated on each
                 partition before caching, e.g. "(self.data['FLAGS_GOLD'] == 0)"
     max_tiles : maximum number of partitions kept in the cache (None = unbounded)
+    derived   : optional {name: numpy expression} of columns computed from
+                the loaded columns of each partition before the selection
+                (see :func:`add_derived`); `columns` must include their inputs
     """
 
-    def __init__(self, path, columns=None, selection=None, max_tiles=64):
+    def __init__(self, path, columns=None, selection=None, max_tiles=64, derived=None):
         self.path = path
+        self.derived = dict(derived) if derived else None
         self.columns = list(columns) if columns is not None else None
         self.selection = selection
         self.max_tiles = max_tiles
@@ -174,6 +228,7 @@ class HatsCatalogReader(object):
         pf = pq.ParquetFile(fname)
         table = pf.read(columns=self.columns)
         data = table_to_recarray(table)
+        data = add_derived(data, self.derived)
         nbytes = table.nbytes  # bytes of the columns actually read (uncompressed)
         if self.selection:
             sel = eval(self.selection, {'np': np}, {'self': _SelectionData(data)})
@@ -301,10 +356,14 @@ def default_columns(config):
     import re
     cols += re.findall(r"self\.data\['([^']+)'\]", selection)
     cols += re.findall(r'self\.data\["([^"]+)"\]', selection)
+    # Derived columns are computed, not read: read their inputs instead
+    # (identifiers that are not catalog columns are dropped by get_reader)
+    derived = (cat.get('hats') or {}).get('derived') or {}
+    cols = [c for c in cols if c not in derived] + derived_inputs(derived)
     # Keep order, drop duplicates
     out = []
     for c in cols:
-        if c not in out: out.append(c)
+        if c not in out and c not in derived and c != 'np': out.append(c)
     return out
 
 
@@ -319,19 +378,23 @@ def get_reader(config):
         raise ValueError("Config has no 'catalog: hats:' block")
     path = os.path.expandvars(hcfg['path'])
     columns = tuple(hcfg.get('columns') or default_columns(config))
+    derived = hcfg.get('derived') or None
     key = (path, columns, config['catalog'].get('selection') or None,
-           hcfg.get('max_tiles', 64))
+           hcfg.get('max_tiles', 64),
+           tuple((k, str(v)) for k, v in derived.items()) if derived else None)
     if key not in _READERS:
         # Columns that may not exist in the catalog (e.g. MC_SOURCE_ID) are
         # added by Catalog._defineVariables; drop them here.
         import pyarrow.parquet as pq
         orders, pixels = read_partition_info(path)
         schema = pq.ParquetFile(tile_path(path, orders[0], pixels[0])).schema_arrow
-        missing = [c for c in columns if c not in schema.names]
+        inputs = set(derived_inputs(derived))
+        missing = [c for c in columns if c not in schema.names and c not in inputs]
         if missing:
             logger.warning("Columns not in HATS catalog (ignored): %s" % missing)
         use = [c for c in columns if c in schema.names]
-        reader = HatsCatalogReader(path, columns=use, selection=key[2], max_tiles=key[3])
+        reader = HatsCatalogReader(path, columns=use, selection=key[2], max_tiles=key[3],
+                                   derived=derived)
         reader.lon_field = config['catalog']['lon_field']
         reader.lat_field = config['catalog']['lat_field']
         _READERS[key] = reader

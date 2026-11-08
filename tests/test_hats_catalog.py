@@ -190,3 +190,60 @@ def test_get_reader_config(synth):
     assert r1.columns == cols and r1.max_tiles == 5
     data = hc.load_catalog_pixels(config, np.arange(hp.nside2npix(16)))
     assert np.all(data['FLAG'] == 0)
+
+
+FIXTURE = os.path.join(os.path.dirname(__file__), 'data', 'desy6', 'hats', 'desy6_fixture')
+
+
+def test_add_derived():
+    rec = np.zeros(3, dtype=[('A', 'f4'), ('B', 'f8')])
+    rec['A'] = [1, 2, 3]
+    rec['B'] = [0.5, 0.5, 1.0]
+    out = hc.add_derived(rec, {'C': 'A - 2 * B', 'D': 'np.where(C > 0, C, np.nan)', 'A': 'A + 1'})
+    assert out.dtype.names == ('B', 'C', 'D', 'A')
+    np.testing.assert_allclose(out['C'], [0, 1, 1])
+    np.testing.assert_allclose(out['D'], [np.nan, 1, 1])
+    np.testing.assert_allclose(out['A'], [2, 3, 4])
+    assert hc.add_derived(rec, None) is rec
+    assert hc.derived_inputs({'C': 'A - 2 * B', 'D': 'np.abs(C)'}) == ['A', 'B', 'np', 'abs', 'C']
+
+
+def test_table_to_recarray_null_bool():
+    tab = pa.table({'F': pa.array([True, None, False], type=pa.bool_()),
+                    'X': pa.array([1.0, None, 3.0])})
+    rec = hc.table_to_recarray(tab)
+    assert rec['F'].dtype == np.bool_
+    np.testing.assert_array_equal(rec['F'], [True, False, False])
+    assert np.isnan(rec['X'][1])
+
+
+@pytest.mark.skipif(not os.path.exists(FIXTURE), reason='DES Y6 HATS fixture not available')
+def test_derived_columns_on_fixture():
+    """A derived (dereddened-style) magnitude on the DES Y6 HATS fixture, usable
+    as a mag field and in the selection string."""
+    config = {
+        'catalog': {
+            'hats': {'path': FIXTURE, 'max_tiles': 16,
+                     'derived': {'G_DERED': 'PSF_MAG_APER_8_G_CORRECTED - 0.1 * EXT_XGB',
+                                 'GR': 'G_DERED - PSF_MAG_APER_8_R_CORRECTED'}},
+            'objid_field': 'COADD_OBJECT_ID', 'lon_field': 'RA', 'lat_field': 'DEC',
+            'mag_1_field': 'G_DERED', 'mag_err_1_field': 'PSF_MAG_ERR_APER_8_G',
+            'mag_2_field': 'PSF_MAG_APER_8_R_CORRECTED', 'mag_err_2_field': 'PSF_MAG_ERR_APER_8_R',
+            'selection': "(self.data['GR'] < 1.0) & (self.data['EXT_XGB'] >= 0)",
+        },
+        'coords': {'nside_catalog': 32},
+    }
+    cols = hc.default_columns(config)
+    assert 'G_DERED' not in cols and 'GR' not in cols
+    assert 'PSF_MAG_APER_8_G_CORRECTED' in cols and 'EXT_XGB' in cols
+    reader = hc.get_reader(config)
+    orders, pixels = hc.read_partition_info(FIXTURE)
+    data = reader.get_tile((orders[0], pixels[0]))
+    assert len(data) > 0
+    np.testing.assert_allclose(data['G_DERED'],
+                               data['PSF_MAG_APER_8_G_CORRECTED'] - 0.1 * data['EXT_XGB'], rtol=1e-6)
+    assert np.all(data['GR'] < 1.0) and np.all(data['EXT_XGB'] >= 0)
+    # the selection was applied after deriving: compare with a plain read
+    raw = HatsCatalogReader(FIXTURE, columns=reader.columns).get_tile((orders[0], pixels[0]))
+    gr = raw['PSF_MAG_APER_8_G_CORRECTED'] - 0.1 * raw['EXT_XGB'] - raw['PSF_MAG_APER_8_R_CORRECTED']
+    assert len(data) == int(np.sum((gr < 1.0) & (raw['EXT_XGB'] >= 0)))

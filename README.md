@@ -146,6 +146,25 @@ shows up as a 1-ulp change of LOG_LIKELIHOOD in a few percent of pixels where
 TS < 1e-4 (5 of 704 pixels in the DES Y6 reference region). The mask files
 are still read from `mask: dirname`.
 
+Columns that the catalog does not provide directly (e.g. extinction-corrected
+magnitudes) can be computed per partition with `derived`, a mapping of new
+column name to a numpy expression of the catalog columns (`np` is available;
+expressions are evaluated in order, so later ones may use earlier ones):
+```yaml
+catalog:
+  hats:
+    path: /path/to/rubin_dp2/object_collection/object_lc
+    derived:
+      g_psfMag_dered: "g_psfMag - 3.64 * ebv"
+      r_psfMag_dered: "r_psfMag - 2.70 * ebv"
+  mag_1_field: g_psfMag_dered
+  mag_2_field: r_psfMag_dered
+```
+The derived columns are added before the `selection` is applied, so the
+selection and the `*_field` keys may name them; their inputs are read instead
+of them (only identifiers that are catalog columns are read). Null boolean
+values (e.g. flags of a band without a measurement) are read as `False`.
+
 Depth masks can likewise be read from [HealSparse](https://healsparse.readthedocs.io)
 maps instead of the per-pixel mask files, by replacing `dirname`/`basename_*`
 in the `mask` section with:
