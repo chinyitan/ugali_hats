@@ -27,6 +27,15 @@ from concurrent.futures import ProcessPoolExecutor, wait, FIRST_COMPLETED
 from concurrent.futures.process import BrokenProcessPool
 from os.path import exists, dirname
 
+# One BLAS/OpenMP thread per worker: the scan is made of small numpy
+# operations (e.g. the 3x3 solves of the richness parabola), and a
+# multi-threaded BLAS in every worker oversubscribes the machine (measured
+# 3x slower with 48 workers). Set before numpy is imported so that it takes
+# effect when this module is run as a script; an explicit setting in the
+# environment is respected.
+for _var in ('OMP_NUM_THREADS', 'OPENBLAS_NUM_THREADS', 'MKL_NUM_THREADS'):
+    os.environ.setdefault(_var, '1')
+
 import numpy as np
 import healpy as hp
 
@@ -37,8 +46,9 @@ from ugali.utils.projector import gal2cel
 from ugali.utils.logger import logger
 from ugali.utils.shell import mkdir
 
-STAT_FIELDS = ['pix', 'lon', 'lat', 'runtime_s', 'hits', 'misses',
-               'bytes_read', 'rows_read', 'read_time', 'pid', 'status', 'error']
+STAT_FIELDS = ['pix', 'lon', 'lat', 'runtime_s', 'setup_s', 'search_s',
+               'hits', 'misses', 'bytes_read', 'rows_read', 'read_time',
+               'pid', 'status', 'error']
 
 # Memory needed per worker for a DES-like scan (measured ~3.6 GB RSS)
 MEMORY_PER_WORKER_GB = 4.0
@@ -152,9 +162,9 @@ def scan_pixel(pix):
     force = _STATE['force']
 
     outfile = _outfile(config, pix)
-    rec = dict(pix=int(pix), lon=np.nan, lat=np.nan, runtime_s=0.0, hits=0,
-               misses=0, bytes_read=0, rows_read=0, read_time=0.0,
-               pid=os.getpid(), status='ok', error='')
+    rec = dict(pix=int(pix), lon=np.nan, lat=np.nan, runtime_s=0.0,
+               setup_s=0.0, search_s=0.0, hits=0, misses=0, bytes_read=0,
+               rows_read=0, read_time=0.0, pid=os.getpid(), status='ok', error='')
     if exists(outfile) and not force:
         rec['status'] = 'skipped'
         return rec
@@ -169,7 +179,10 @@ def scan_pixel(pix):
         # The Config object (not the filename) is passed so that overrides
         # such as --max-tiles reach the workers.
         grid = createGridSearch(config, lon, lat)
+        rec['setup_s'] = time.time() - t0
+        t1 = time.time()
         grid.search()
+        rec['search_s'] = time.time() - t1
         mkdir(dirname(outfile))
         # Atomic write: a crash can't leave a truncated output behind
         grid.write(tmpfile)
@@ -198,6 +211,14 @@ def scan_chunk(pixels):
 def _init_worker():
     # Let the parent handle Ctrl-C; workers are cleaned up by the executor.
     signal.signal(signal.SIGINT, signal.SIG_IGN)
+    # Pin the BLAS thread pool inherited from the parent to one thread
+    # (the environment variables above only help if numpy was imported
+    # after they were set, e.g. when this module is run as a script).
+    try:
+        import threadpoolctl
+        threadpoolctl.threadpool_limits(1)
+    except ImportError:
+        pass
 
 
 def _make_pool(n_jobs, max_tasks_per_child=None):
@@ -327,7 +348,10 @@ def summarize(records, total):
     print("pixels: %i ok, %i skipped, %i failed" % (len(ran), nskip, nfail))
     print("total time: %.1fs  (%.4f pixels/s)" % (total, len(ran) / total if total > 0 else 0))
     if ran:
-        print("mean per-pixel runtime: %.1fs" % np.mean([r['runtime_s'] for r in ran]))
+        print("mean per-pixel runtime: %.1fs (setup %.1fs, search %.1fs)" % (
+            np.mean([r['runtime_s'] for r in ran]),
+            np.mean([r.get('setup_s', 0.) for r in ran]),
+            np.mean([r.get('search_s', 0.) for r in ran])))
     print("cache: hits=%i misses=%i hit_rate=%.3f  read=%.1f MB" % (hits, misses, rate, mb))
     for r in records:
         if r['status'] == 'failed':
