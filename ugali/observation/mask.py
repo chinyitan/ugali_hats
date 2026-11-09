@@ -9,9 +9,11 @@ Functions
 """
 
 import os
+from collections import OrderedDict as odict
 import numpy as np
 import healpy as hp
 import scipy.signal
+import fitsio
 
 import ugali.utils.binning
 import ugali.utils.skymap
@@ -32,11 +34,17 @@ class Mask(object):
     def __init__(self, config, roi):
         self.config = Config(config)
         self.roi = roi
-        filenames = self.config.getFilenames()
-        catalog_pixels = self.roi.getCatalogPixels()
+        healsparse = self.config['mask'].get('healsparse')
+        if healsparse:
+            # Depth maps in HealSparse format (ugali.observation.healsparse_mask)
+            self.mask_1 = HealSparseMaskBand(healsparse,1,self.roi)
+            self.mask_2 = HealSparseMaskBand(healsparse,2,self.roi)
+        else:
+            filenames = self.config.getFilenames()
+            catalog_pixels = self.roi.getCatalogPixels()
 
-        self.mask_1 = MaskBand(filenames['mask_1'][catalog_pixels],self.roi)
-        self.mask_2 = MaskBand(filenames['mask_2'][catalog_pixels],self.roi)
+            self.mask_1 = MaskBand(filenames['mask_1'][catalog_pixels],self.roi)
+            self.mask_2 = MaskBand(filenames['mask_2'][catalog_pixels],self.roi)
         self._fracRoiSparse()
 
         self.minimum_solid_angle = self.config.params['mask']['minimum_solid_angle'] # deg^2
@@ -61,9 +69,17 @@ class Mask(object):
         # Also possible and simple:
         #return np.unique(zip(self.mask_1.mask_roi_sparse,self.mask_2.mask_roi_sparse))
 
-        A = np.vstack([self.mask_1.mask_roi_sparse,self.mask_2.mask_roi_sparse]).T
-        B = A[np.lexsort(A.T[::-1])]
-        return B[np.concatenate(([True],np.any(B[1:]!=B[:-1],axis=1)))]
+        # Memoized on the (identity of the) sparse mask arrays: the
+        # observable fraction asks for this at every distance modulus.
+        key = (id(self.mask_1.mask_roi_sparse), id(self.mask_2.mask_roi_sparse))
+        cache = self.__dict__.setdefault('_mask_roi_unique_cache', {})
+        if cache.get('key') != key:
+            A = np.vstack([self.mask_1.mask_roi_sparse,self.mask_2.mask_roi_sparse]).T
+            B = A[np.lexsort(A.T[::-1])]
+            cache.clear()
+            cache['key'] = key
+            cache['unique'] = B[np.concatenate(([True],np.any(B[1:]!=B[:-1],axis=1)))]
+        return cache['unique']
 
     @property
     def mask_roi_digi(self):
@@ -71,19 +87,24 @@ class Mask(object):
         Get the index of the unique magnitude tuple for each pixel in the ROI.
         """
         # http://stackoverflow.com/q/24205045/#24206440
-        A = np.vstack([self.mask_1.mask_roi_sparse,self.mask_2.mask_roi_sparse]).T
         B = self.mask_roi_unique
+        cache = self.__dict__['_mask_roi_unique_cache'] # filled by mask_roi_unique
+        if 'digi' in cache:
+            return cache['digi']
+
+        A = np.vstack([self.mask_1.mask_roi_sparse,self.mask_2.mask_roi_sparse]).T
 
         AA = np.ascontiguousarray(A)
         BB = np.ascontiguousarray(B)
-         
+
         dt = np.dtype((np.void, AA.dtype.itemsize * AA.shape[1]))
         a = AA.view(dt).ravel()
         b = BB.view(dt).ravel()
-         
+
         idx = np.argsort(b)
         indices = np.searchsorted(b[idx],a)
-        return idx[indices]
+        cache['digi'] = idx[indices]
+        return cache['digi']
 
     @property
     def frac_annulus_sparse(self):
@@ -701,6 +722,67 @@ class Mask(object):
 
 ############################################################
 
+# Process-wide cache of sparse mask files (PIXEL, MAGLIM[, FRACDET]),
+# keyed by filename. Neighbouring ROIs read the same catalog-pixel mask
+# files, and each file used to be read twice per band (MAGLIM, FRACDET).
+_MASK_FILE_CACHE = odict()
+MASK_FILE_CACHE_SIZE = 64
+
+def read_mask_file(filename, ext=1):
+    """Return (header, data) of a sparse mask file through the process cache.
+    `data` holds PIXEL, MAGLIM and (when present) FRACDET; treat it as read-only."""
+    entry = _MASK_FILE_CACHE.get(filename)
+    if entry is not None:
+        _MASK_FILE_CACHE.move_to_end(filename)
+        return entry
+    with fitsio.FITS(filename) as fits:
+        header = fits[ext].read_header()
+        columns = [c for c in ('PIXEL','MAGLIM','FRACDET') if c in fits[ext].get_colnames()]
+        data = fits[ext].read(columns=columns)
+    entry = (header, data)
+    _MASK_FILE_CACHE[filename] = entry
+    while len(_MASK_FILE_CACHE) > MASK_FILE_CACHE_SIZE:
+        _MASK_FILE_CACHE.popitem(last=False)
+    return entry
+
+def clear_mask_file_cache():
+    _MASK_FILE_CACHE.clear()
+
+def read_mask_sparse(infiles, column, pixels):
+    """
+    Values of `column` of the sparse mask files at `pixels`, i.e. exactly
+    `healpix.read_partial_map(infiles, column)[2][pixels]` (UNSEEN where a
+    pixel is not in the files), without building the full-sky map and
+    reading the files through the process cache.
+
+    Raises ValueError if the column is not in the files (like fitsio).
+    """
+    infiles = np.atleast_1d(infiles)
+    header, _ = read_mask_file(infiles[0])
+    nside = header['NSIDE']
+    pix, value = [], []
+    for f in infiles:
+        data = read_mask_file(f)[1]
+        if column not in data.dtype.names:
+            raise ValueError("Column '%s' not found in %s" % (column, f))
+        pix.append(data['PIXEL']); value.append(data[column])
+    pix = np.concatenate(pix); value = np.concatenate(value)
+
+    ndupes = len(pix) - len(np.unique(pix))
+    if ndupes > 0:
+        msg = '%i duplicate pixels during load.'%(ndupes)
+        raise Exception(msg)
+
+    pixels = np.asarray(pixels)
+    out = hp.UNSEEN * np.ones(pixels.shape, dtype=value.dtype)
+    if len(pix):
+        order = np.argsort(pix)
+        spix = pix[order]
+        idx = np.minimum(np.searchsorted(spix, pixels), len(spix)-1)
+        found = spix[idx] == pixels
+        out[found] = value[order][idx[found]]
+    return nside, out
+
 class MaskBand(object):
     """
     Map of liming magnitude for a single observing band.
@@ -720,20 +802,17 @@ class MaskBand(object):
         self.roi = roi
         self.config = self.roi.config
 
-        # ADW: It's overkill to make the full map just to slim it
-        # down, but we don't have a great way to go from map pixels to
-        # roi pixels.
-        nside,pixel,maglim = healpix.read_partial_map(infiles,column='MAGLIM')
+        # Sparse maps of pixels in various ROI regions (same values as
+        # healpix.read_partial_map(infiles,'MAGLIM')[2][self.roi.pixels])
+        nside,maglim = read_mask_sparse(infiles,'MAGLIM',self.roi.pixels)
         self.nside = nside
-
-        # Sparse maps of pixels in various ROI regions
-        self.mask_roi_sparse = maglim[self.roi.pixels] 
+        self.mask_roi_sparse = maglim
 
         # Try to get the detection fraction
         self.frac_roi_sparse = (self.mask_roi_sparse > 0)
-        try: 
+        try:
             logger.debug("Reading FRACDET...")
-            nside,pixel,frac=healpix.read_partial_map(infiles,column='FRACDET')
+            nside,frac=read_mask_sparse(infiles,'FRACDET',self.roi.pixels)
             # This clipping might gloss over bugs...
             fractype = self.config['mask'].get('fractype','binary')
             fracmin = self.config['mask'].get('fracmin',0.5)
@@ -747,7 +826,7 @@ class MaskBand(object):
                 msg = "Unrecognized fractype: %s"%fractype
                 logger.warning(msg)
                 
-            self.frac_roi_sparse = np.clip(frac[self.roi.pixels],0.0,1.0)
+            self.frac_roi_sparse = np.clip(frac,0.0,1.0)
         except ValueError as e:
             # No detection fraction present
             msg = "No 'FRACDET' column found in masks; assuming FRACDET = 1.0"
@@ -755,6 +834,21 @@ class MaskBand(object):
 
         # Explicitly zero the maglim of pixels with fracdet < fracmin
         self.mask_roi_sparse[self.frac_roi_sparse == 0] = 0.0
+
+    def _apply_fractype(self, frac):
+        """Detection fraction of the ROI pixels after the configured fractype/fracmin cut."""
+        fractype = self.config['mask'].get('fractype','binary')
+        fracmin = self.config['mask'].get('fracmin',0.5)
+        if fractype == 'binary':
+            frac = np.where(frac < fracmin, 0.0, 1.0)
+        elif fractype == 'full':
+            frac = np.where(frac < fracmin, 0.0, frac)
+        elif not fractype:
+            pass
+        else:
+            msg = "Unrecognized fractype: %s"%fractype
+            logger.warning(msg)
+        return np.clip(frac,0.0,1.0)
 
     #ADW: Safer and more robust (though slightly slower)
     @property
@@ -811,6 +905,40 @@ class MaskBand(object):
         Magnitude limit at given image coordinates.
         """
         pass
+
+class HealSparseMaskBand(MaskBand):
+    """
+    Map of limiting magnitude for a single band read from HealSparse
+    depth maps (see ugali.observation.healsparse_mask for the config).
+    Provides the same `mask_roi_sparse` / `frac_roi_sparse` arrays as
+    the file-based MaskBand.
+    """
+
+    def __init__(self, healsparse, band, roi):
+        """
+        Parameters:
+        -----------
+        healsparse : the `mask: healsparse:` config block
+        band : 1 or 2
+        roi : roi object
+        """
+        from ugali.observation import healsparse_mask
+        self.roi = roi
+        self.config = self.roi.config
+        self.nside = self.config['coords']['nside_pixel']
+
+        maglim_files = healsparse['maglim_%i'%band]
+        fracdet_files = healsparse.get('fracdet_%i'%band)
+        maglim,frac = healsparse_mask.band_sparse(
+            maglim_files, self.roi.pixels, self.nside, fracdet_files,
+            reduction=healsparse.get('reduction','mean'),
+            cache_size=healsparse.get('cache_size'))
+
+        self.mask_roi_sparse = maglim
+        self.frac_roi_sparse = self._apply_fractype(frac)
+        # Explicitly zero the maglim of pixels with fracdet < fracmin
+        self.mask_roi_sparse[self.frac_roi_sparse == 0] = 0.0
+
 
 class CoverageBand(object):
     """

@@ -139,6 +139,10 @@ class Catalog:
             msg = "Cannot take both roi and filenames"
             raise Exception(msg)
 
+        if self.config['catalog'].get('hats'):
+            self._parse_hats(roi)
+            return
+
         if roi is not None:
             pixels = roi.getCatalogPixels()
             filenames = self.config.getFilenames()['catalog'][pixels]
@@ -159,6 +163,40 @@ class Catalog:
 
         # Cast data to recarray (historical reasons)
         self.data = self.data.view(np.recarray)
+
+    def _parse_hats(self, roi=None):
+        """
+        Load the catalog from a HATS catalog (see
+        ugali.observation.hats_catalog) through the per-process LRU
+        cache. The rows loaded are those in the ``nside_catalog`` pixels
+        spanned by the ROI (the same pixels whose FITS files the default
+        path would read), so results are identical to the FITS path.
+
+        Parameters:
+        -----------
+        roi : The region of interest; if 'roi=None', read all catalog pixels
+
+        Returns:
+        --------
+        None
+        """
+        from ugali.observation.hats_catalog import load_catalog_pixels
+
+        if roi is not None:
+            pixels = roi.getCatalogPixels()
+        else:
+            pixels = self.config.getFilenames()['pix'].compressed()
+
+        if len(pixels) == 0:
+            msg = "No catalog pixels found."
+            raise Exception(msg)
+
+        data = load_catalog_pixels(self.config, pixels)
+        if data is None:
+            msg = "No HATS partitions overlap catalog pixels: %s"%(pixels)
+            raise Exception(msg)
+        # The selection has already been applied per partition
+        self.data = data.view(np.recarray)
 
     def _applySelection(self,selection=None):
         # ADW: This is a hack (eval is unsafe!)

@@ -68,6 +68,16 @@ def inFootprint(config, pixels, nside=None):
         catalog_pix = superpixel(pixels,nside,nside_catalog)
         catalog_pix = np.intersect1d(catalog_pix,catalog_pixels)
 
+    healsparse = config['mask'].get('healsparse')
+    if healsparse:
+        # Likelihood pixels with valid depth in both bands' maps
+        from ugali.observation.healsparse_mask import valid_superpixels
+        superpix = valid_superpixels([healsparse['maglim_1'],healsparse['maglim_2']],
+                                     nside, catalog_pixels=catalog_pix if nside_catalog else None,
+                                     nside_catalog=nside_catalog)
+        inside |= np.isin(pixels, superpix)
+        return inside
+
     fnames = filenames[catalog_pix]
 
     # Load the first mask

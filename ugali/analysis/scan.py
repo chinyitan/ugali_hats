@@ -98,6 +98,9 @@ class GridSearch:
         self.stellar_mass_conversion = self.source.stellar_mass()
         self.distance_modulus_array = np.asarray(self.config['scan']['distance_modulus_array'])
         self.extension_array = np.asarray(self.config['scan'].get('extension_array',[self.source.extension]))
+        # Fit the richness of all target pixels of a (modulus, extension)
+        # at once (same arithmetic per pixel; see LogLikelihood.fit_richness_batch)
+        self.batch_pixels = self.config['scan'].get('batch_pixels',True)
 
 
     def search(self, coords=None, distance_modulus=None, extension=None, tolerance=1.e-2):
@@ -166,8 +169,13 @@ class GridSearch:
 
             # Set distance_modulus once to save time
             self.loglike.set_params(distance_modulus=distance_modulus)
+            if self.batch_pixels and coord_idx is None:
+                self._search_modulus_batch(ii, extension_idx)
+                npixels_loop = 0
+            else:
+                npixels_loop = npixels
             # Loop over pixels
-            for jj in range(0, npixels):
+            for jj in range(0, npixels_loop):
                 # Specific pixel
                 if coord_idx is not None:
                     if jj != coord_idx: continue
@@ -242,6 +250,43 @@ class GridSearch:
             )
             msg = '  (%-3i/%i) Max at (%.2f, %.2f) : TS=%.1f, Mstar=%.2g, Ext=%.2f'%(args)
             logger.info(msg)
+
+    def _search_modulus_batch(self, ii, extension_idx=None):
+        """
+        The pixel/extension loops of `search` for distance modulus index
+        `ii`, with the richness fit of all pixels of an extension done in
+        one call. Extensions are visited in the same order and the results
+        combined with the same comparison as in the per-pixel loop.
+        """
+        lon, lat = self.roi.pixels_target.lon, self.roi.pixels_target.lat
+        npixels = len(lon)
+        kks = [kk for kk in range(len(self.extension_array))
+               if extension_idx is None or kk == extension_idx]
+        # Sync the signal terms in the same pixel/extension order as the
+        # per-pixel loop (the kernel geometry cache holds one centroid)
+        u = {}; f = {}; extension = {}
+        for jj in range(npixels):
+            self.loglike.set_params(lon=lon[jj],lat=lat[jj])
+            for kk in kks:
+                self.loglike.set_params(extension=self.extension_array[kk])
+                self.loglike.sync_params()
+                if kk not in u:
+                    u[kk] = np.empty((npixels,len(self.loglike.u)),dtype=self.loglike.u.dtype)
+                    f[kk] = np.zeros(npixels)
+                    extension[kk] = self.source.extension
+                u[kk][jj] = self.loglike.u
+                f[kk][jj] = self.loglike.f
+        for kk in kks:
+            loglike, richness = self.loglike.fit_richness_batch(u[kk], f[kk])
+            f_kk, ext_kk = f[kk], extension[kk]
+            for jj in range(npixels):
+                if loglike[jj] < self.loglike_array[ii][jj]:
+                    # No loglike increase, continue
+                    continue
+                self.loglike_array[ii][jj], self.richness_array[ii][jj] = loglike[jj], richness[jj]
+                self.stellar_mass_array[ii][jj] = self.stellar_mass_conversion*self.richness_array[ii][jj]
+                self.fraction_observable_array[ii][jj] = f_kk[jj]
+                self.extension_fit_array[ii][jj] = ext_kk
 
     def mle(self):
         a = self.loglike_array

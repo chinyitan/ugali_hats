@@ -57,6 +57,19 @@ class LogLikelihood(object):
         self.spatial_only = self.config['likelihood'].get('spatial_only',False)
         self.color_only   = self.config['likelihood'].get('color_only',False)
 
+        # Memoization of the spatial signal term (independent of the
+        # distance modulus): keyed by the kernel parameters, so that the
+        # grid search does not recompute it for every distance modulus.
+        self.cache_spatial = self.config['likelihood'].get('cache_spatial',True)
+        self.spatial_cache_size = self.config['likelihood'].get('spatial_cache_size',1024)
+        self._spatial_cache = odict()
+        # Geometry (kernel radius) of the current kernel centroid,
+        # shared by the different extensions evaluated at that centroid.
+        self._spatial_geometry = None
+        # Evaluate the richness fit without re-syncing the unchanged
+        # spatial/color terms (same arithmetic, less overhead).
+        self.fast_richness = self.config['likelihood'].get('fast_richness',True)
+
         if self.spatial_only and self.color_only:
             msg = "Both 'spatial_only' and 'color_only' set"
             logger.error(msg)
@@ -137,10 +150,16 @@ class LogLikelihood(object):
     def set_params(self,**kwargs):
         self.source.set_params(**kwargs)
 
-        if self.pixel not in self.roi.pixels_interior:
-            # ADW: Raising this exception is not strictly necessary, 
-            # but at least a warning should be printed if target outside of region.
-            raise ValueError("Coordinate outside interior ROI.")
+        # The target pixel only changes when the centroid does, so the
+        # check is only repeated when 'lon' or 'lat' (or an alias) is set.
+        mapping = getattr(self.kernel,'_mapping',{})
+        moved = any(mapping.get(k,k) in ('lon','lat') for k in kwargs)
+        if moved or not getattr(self,'_pixel_checked',False):
+            if self.pixel not in self.roi.pixels_interior:
+                # ADW: Raising this exception is not strictly necessary,
+                # but at least a warning should be printed if target outside of region.
+                raise ValueError("Coordinate outside interior ROI.")
+            self._pixel_checked = True
 
     def sync_params(self):
         # The sync_params step updates internal quantities based on
@@ -154,7 +173,7 @@ class LogLikelihood(object):
             self.observable_fraction = self.calc_observable_fraction(self.source.distance_modulus)
             self.u_color = self.calc_signal_color(self.source.distance_modulus)
         if self.source.get_sync('kernel'):
-            self.u_spatial = self.calc_signal_spatial()
+            self.u_spatial = self.calc_signal_spatial_cached()
 
         # Combined object-by-object signal probability
         self._u = self.u_spatial * self.u_color
@@ -209,6 +228,7 @@ class LogLikelihood(object):
         # Set the default catalog
         #logger.info("Using interior ROI for likelihood calculation")
         self.catalog = self.catalog_interior
+        self.clear_spatial_cache()
         #self.pixel_roi_cut = self.roi.pixel_interior_cut
 
     def calc_backgroundCMD(self):
@@ -282,7 +302,9 @@ class LogLikelihood(object):
         """
         mag_1, mag_2 = self.catalog.mag_1,self.catalog.mag_2
         mag_err_1, mag_err_2 = self.catalog.mag_err_1,self.catalog.mag_err_2
-        u_density = self.isochrone.pdf(mag_1,mag_2,mag_err_1,mag_err_2,distance_modulus,self.delta_mag,mass_steps)
+        # likelihood: color_pdf_sparse: True -> faster, not bit-identical (see IsochroneModel.pdf)
+        sparse = self.config['likelihood'].get('color_pdf_sparse',False)
+        u_density = self.isochrone.pdf(mag_1,mag_2,mag_err_1,mag_err_2,distance_modulus,self.delta_mag,mass_steps,sparse=sparse)
 
         #u_color = u_density * self.delta_mag**2
         u_color = u_density
@@ -370,6 +392,108 @@ class LogLikelihood(object):
         u_spatial = self.surface_intensity_object
         return u_spatial
 
+    def spatial_cache_key(self):
+        """Key identifying the spatial signal term: the kernel model and
+        its parameter values, plus the catalog and ROI it is evaluated on."""
+        params = tuple((k,float(v.value)) for k,v in self.kernel.params.items())
+        return (self.kernel.name, params,
+                id(self.catalog), len(self.catalog), id(self.roi))
+
+    def clear_spatial_cache(self):
+        if hasattr(self,'_spatial_cache'):
+            self._spatial_cache.clear()
+        self._spatial_geometry = None
+
+    def spatial_geometry_key(self):
+        """Key identifying the kernel centroid geometry: every kernel
+        parameter except the radial profile ones (extension, truncate)."""
+        params = tuple((k,float(v.value)) for k,v in self.kernel.params.items()
+                       if k not in ('extension','truncate'))
+        return (self.kernel.name, params,
+                id(self.catalog), len(self.catalog), id(self.roi))
+
+    def calc_spatial_geometry(self, factor=10):
+        """
+        Elliptical radii of the ROI pixels, of the adaptively subsampled
+        pixels around the centroid, and of the catalog objects, for the
+        current kernel centroid. These are what `calc_surface_intensity`
+        and `calc_signal_spatial` feed to the kernel pdf; they depend on
+        the centroid/shape but not on the extension, so they are computed
+        once per centroid and reused for every extension.
+        """
+        pixels = self.roi.pixels_interior
+        nside_in = self.config['coords']['nside_pixel']
+        geom = dict(key=self.spatial_geometry_key())
+        geom['radius_sparse'] = self.kernel.radius(pixels.lon,pixels.lat)
+        levels = []
+        for i in np.arange(1,5):
+            nside_out = 2**i * nside_in
+            radius = factor*np.degrees(hp.max_pixrad(nside_out))
+            pix = ang2disc(nside_in,self.kernel.lon,self.kernel.lat,
+                           radius,inclusive=True)
+            idx = ugali.utils.healpix.index_pix_in_pixels(pix,pixels)
+            pix = pix[(idx >= 0)]; idx = idx[(idx >= 0)]
+            subpix = ugali.utils.healpix.ud_grade_ipix(pix,nside_in,nside_out)
+            pix_lon,pix_lat = pix2ang(nside_out,subpix)
+            levels.append((idx, self.kernel.radius(pix_lon,pix_lat)))
+        geom['levels'] = levels
+        geom['radius_object'] = self.kernel.radius(self.catalog.lon,self.catalog.lat)
+        return geom
+
+    def calc_signal_spatial_geom(self, factor=10):
+        """
+        `calc_signal_spatial` evaluated from the cached centroid geometry:
+        identical arithmetic (kernel.pdf is norm*_pdf(radius)), but the
+        radii are computed once per centroid instead of once per extension.
+        """
+        kernel = self.kernel
+        if not hasattr(kernel,'pdf_from_radius'):
+            return self.calc_signal_spatial()
+
+        key = self.spatial_geometry_key()
+        geom = self._spatial_geometry
+        if geom is None or geom['key'] != key:
+            geom = self._spatial_geometry = self.calc_spatial_geometry(factor)
+
+        surface_intensity = kernel.pdf_from_radius(geom['radius_sparse'])
+        for idx,radius in geom['levels']:
+            surface_intensity[idx] = np.mean(kernel.pdf_from_radius(radius),axis=1)
+        self.surface_intensity_sparse = surface_intensity
+        self.surface_intensity_object = kernel.pdf_from_radius(geom['radius_object'])
+        u_spatial = self.surface_intensity_object
+        return u_spatial
+
+    def calc_signal_spatial_cached(self):
+        """
+        Memoized `calc_signal_spatial`. The spatial term depends only
+        on the kernel (position, extension, shape), not on the distance
+        modulus, but the grid search sets the kernel for every
+        (pixel, extension) at each modulus; caching the result keyed by
+        the kernel parameters avoids recomputing it for each modulus.
+        The cached values are exactly those `calc_signal_spatial` would
+        return (identical inputs), so results are unchanged. Disable
+        with `likelihood: cache_spatial: False`.
+
+        Returns:
+        --------
+        u_spatial : array of spatial probabilities per object
+        """
+        if not getattr(self,'cache_spatial',False):
+            return self.calc_signal_spatial()
+
+        key = self.spatial_cache_key()
+        hit = self._spatial_cache.get(key)
+        if hit is not None:
+            u_spatial, self.surface_intensity_sparse, self.surface_intensity_object = hit
+            return u_spatial
+
+        u_spatial = self.calc_signal_spatial_geom()
+        if len(self._spatial_cache) >= self.spatial_cache_size:
+            self._spatial_cache.clear()
+        self._spatial_cache[key] = (u_spatial, self.surface_intensity_sparse,
+                                    self.surface_intensity_object)
+        return u_spatial
+
     ############################################################################
     # Methods for fitting and working with the likelihood
     ############################################################################
@@ -406,9 +530,24 @@ class LogLikelihood(object):
             logger.warning("Observable fraction is zero")
             return 0., 0., None
 
+        if getattr(self,'fast_richness',False):
+            # Model owning the richness parameter (set directly below,
+            # bypassing the per-call model lookup in Source.set_params).
+            for key,model in self.source.models.items():
+                if 'richness' in model.params:
+                    self._richness_model = model
+                    break
+            value = self._value_richness
+            # Make sure every pending parameter change is applied first
+            # (self.value would do this on its first call).
+            if any(self.source.get_sync(k) for k in self.source.models.keys()):
+                self.sync_params()
+        else:
+            value = lambda r: self.value(richness=r)
+
         # Richness corresponding to 0, 1, and 10 observable stars
         richness = np.array([0., 1./self.f, 10./self.f])
-        loglike = np.array([self.value(richness=r) for r in richness])
+        loglike = np.array([value(r) for r in richness])
 
         found_maximum = False
         iteration = 0
@@ -418,7 +557,7 @@ class LogLikelihood(object):
                 found_maximum = True
             else:
                 richness = np.append(richness, parabola.vertex_x)
-                loglike  = np.append(loglike, self.value(richness=richness[-1]))
+                loglike  = np.append(loglike, value(richness[-1]))
 
                 if np.fabs(loglike[-1] - np.max(loglike[0: -1])) < atol:
                     found_maximum = True
@@ -429,6 +568,119 @@ class LogLikelihood(object):
             
         index = np.argmax(loglike)
         return loglike[index], richness[index], parabola
+
+    def fit_richness_batch(self, u, f, atol=1.e-3, maxiter=50):
+        """
+        `fit_richness` for many kernel positions at once.
+
+        Parameters:
+        -----------
+        u : (npos, nobj) signal probabilities, one row per position (what
+            `self.u` is after syncing that position); float64, C-contiguous
+        f : (npos,) observable fractions (`self.f` of each position)
+        atol, maxiter : as in `fit_richness`
+
+        Returns:
+        --------
+        loglike, richness : (npos,) arrays with the values `fit_richness`
+            returns for each position
+
+        Every row goes through exactly the operations of `fit_richness`:
+        the element-wise arithmetic is the same, and numpy reduces a
+        C-contiguous row of a 2D array with the same pairwise summation
+        as a 1D array, so the per-row results are bit-identical. The
+        parabola steps are done per row with the same Parabola class.
+        """
+        u = np.ascontiguousarray(u)
+        f = np.asarray(f, dtype=np.float64)
+        npos = len(f)
+        b = self._b
+        if u.dtype != np.float64 or u.ndim != 2 or (npos and len(b) != u.shape[1]):
+            # Not the configuration the batched arithmetic reproduces
+            loglike = np.zeros(npos); richness = np.zeros(npos)
+            for j in range(npos):
+                self._u, self._f = u[j], f[j]
+                loglike[j], richness[j], _ = self.fit_richness(atol, maxiter)
+            return loglike, richness
+
+        # Same guard conditions as fit_richness, per row
+        skip = np.isnan(u).any(axis=1) | ~np.any(u, axis=1) | (f == 0)
+        if skip.any():
+            logger.warning("Signal probability NaN/zero or observable fraction zero for %i position(s)" % skip.sum())
+        active = np.nonzero(~skip)[0]
+
+        param = None
+        for key,model in self.source.models.items():
+            if 'richness' in model.params:
+                param = model.getp('richness')
+                break
+
+        def evaluate(rows, r):
+            # -1.*log(1-p).sum() - f*r for the given rows at richness r
+            # (r as a float64 array, one value per row)
+            if param is not None:
+                for value in r: param.check_bounds(value)
+            uu = u[rows]                     # fancy indexing -> C-contiguous copy
+            ru = r[:,np.newaxis] * uu
+            p = ru/(ru + b)
+            return -1. * np.log(1.-p).sum(axis=1) - (f[rows] * r)
+
+        loglike_out = np.zeros(npos); richness_out = np.zeros(npos)
+        if len(active) == 0:
+            return loglike_out, richness_out
+
+        # Richness corresponding to 0, 1, and 10 observable stars
+        fa = f[active]
+        rich = [np.zeros(len(active)), 1./fa, 10./fa]
+        logl = [evaluate(active, r) for r in rich]
+        richness = [list(col) for col in np.array(rich).T]   # per row lists
+        loglike  = [list(col) for col in np.array(logl).T]
+
+        found = np.zeros(len(active), dtype=bool)
+        parabolas = [None]*len(active)
+        iteration = 0
+        while not found.all():
+            todo = np.nonzero(~found)[0]
+            newr = np.zeros(len(todo)); needs = np.zeros(len(todo), dtype=bool)
+            for n,i in enumerate(todo):
+                parabola = ugali.utils.parabola.Parabola(np.array(richness[i]), 2.*np.array(loglike[i]))
+                parabolas[i] = parabola
+                if parabola.vertex_x < 0.:
+                    found[i] = True
+                else:
+                    newr[n] = parabola.vertex_x; needs[n] = True
+            if needs.any():
+                rows = todo[needs]
+                vals = evaluate(active[rows], newr[needs])
+                for n,i in enumerate(rows):
+                    richness[i].append(newr[needs][n]); loglike[i].append(vals[n])
+                    if np.fabs(loglike[i][-1] - np.max(loglike[i][0:-1])) < atol:
+                        found[i] = True
+            iteration += 1
+            if iteration > maxiter:
+                logger.warning("Maximum number of iterations reached")
+                break
+
+        for n,i in enumerate(active):
+            ll = np.array(loglike[n]); rr = np.array(richness[n])
+            index = np.argmax(ll)
+            loglike_out[i], richness_out[i] = ll[index], rr[index]
+        return loglike_out, richness_out
+
+    def _value_richness(self, richness):
+        """
+        Log-likelihood at `richness` with all other parameters synced.
+        Same arithmetic as `value(richness=...)` (set richness, compute
+        the membership probability and the log-likelihood), but skips
+        re-syncing the spatial and color terms, which do not depend on
+        richness, and the per-call pixel check.
+        """
+        model = self._richness_model
+        model.setp('richness', richness)    # bounds check + scalar conversion
+        richness = model.getp('richness').value
+        ru = richness * self._u
+        self._p = ru/(ru + self._b)
+        return -1. * np.log(1.-self._p).sum() - (self._f * richness)
 
     def richness_interval(self, alpha=0.6827, n_pdf_points=100):
         loglike_max, richness_max, parabola = self.fit_richness()

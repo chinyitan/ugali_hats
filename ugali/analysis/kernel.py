@@ -185,14 +185,22 @@ class EllipticalKernel(Kernel):
         return angsep(self.lon,self.lat,lon,lat)
         
     def radius(self,lon,lat):
+        """Elliptical radius of (lon,lat) from the kernel centroid.
+        Depends on the centroid, ellipticity and position angle only
+        (not on the extension), so it can be reused across extensions."""
         x,y = self.projector.sphereToImage(lon,lat)
         costh = np.cos(np.radians(self.theta))
         sinth = np.sin(np.radians(self.theta))
         return np.sqrt(((x*costh-y*sinth)/(1-self.e))**2 + (x*sinth+y*costh)**2)
-        
+
+    def pdf_from_radius(self, radius):
+        """Normalized, truncated pdf at a pre-computed elliptical radius
+        (what `pdf` returns for the coordinates that produced `radius`)."""
+        return self.norm*self._pdf(radius)
+
     def pdf(self,lon,lat):
         radius = self.radius(lon,lat)
-        return self.norm*self._pdf(radius)
+        return self.pdf_from_radius(radius)
 
     def sample_radius(self, n):
         """
@@ -362,7 +370,14 @@ class EllipticalPlummer(EllipticalKernel):
 
     def _cache(self, name=None):
         if name in [None,'extension','ellipticity','truncate']:
-            self._norm = 1./self.integrate() * 1./self.jacobian
+            # The normalization only depends on these parameters; the
+            # grid search cycles through a few extension values for
+            # every pixel and distance modulus, so memoize the integral.
+            key = (float(self.extension), float(self.ellipticity), float(self.truncate))
+            cache = self.__dict__.setdefault('_norm_cache', {})
+            if key not in cache:
+                cache[key] = 1./self.integrate() * 1./self.jacobian
+            self._norm = cache[key]
         else:
             return
 
@@ -407,7 +422,11 @@ class EllipticalKing(EllipticalKernel):
 
     def _cache(self, name=None):
         if name in [None,'extension','ellipticity','truncate']:
-            self._norm = 1./self.integrate()
+            key = (float(self.extension), float(self.ellipticity), float(self.truncate))
+            cache = self.__dict__.setdefault('_norm_cache', {})
+            if key not in cache:
+                cache[key] = 1./self.integrate()
+            self._norm = cache[key]
         else:
             return
 
@@ -450,12 +469,15 @@ class RadialKernel(EllipticalKernel):
         #self._params['extension'].set(0.1, [1e-4, 0.1])
         super(RadialKernel,self).__init__(**kwargs)
         
-    def pdf(self, lon, lat):
+    def radius(self, lon, lat):
         if self.projector is None:
-            radius = angsep(self.lon,self.lat,lon,lat)
-            return self.norm*self._pdf(radius)
+            return angsep(self.lon,self.lat,lon,lat)
         else:
-            return super(RadialKernel,self).pdf(lon,lat)
+            return super(RadialKernel,self).radius(lon,lat)
+
+    def pdf(self, lon, lat):
+        radius = self.radius(lon,lat)
+        return self.pdf_from_radius(radius)
 
     # Back-compatibility
     def surfaceIntensity(self,radius):

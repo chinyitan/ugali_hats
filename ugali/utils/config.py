@@ -117,6 +117,13 @@ class Config(dict):
                 ('batch',[]),
                 ])  
 
+        # A HATS catalog replaces the per-pixel FITS files
+        if self.get('catalog',{}).get('hats'):
+            sections['catalog'] = [k for k in sections['catalog']
+                                   if k not in ('dirname','basename')]
+            if 'path' not in self['catalog']['hats']:
+                raise Exception("Missing key in catalog.hats: 'path'")
+
         keys = np.array(list(sections.keys()))
         found = np.isin(keys,list(self.keys()))
 
@@ -194,21 +201,38 @@ class Config(dict):
         npix = hp.nside2npix(nside_catalog)
         pixels = np.arange(npix)
 
-        catalog_dir = os.path.expandvars(self['catalog']['dirname'])
-        if not os.path.isdir(catalog_dir):
-            msg = "Directory does not exist: %s"%catalog_dir
-            raise IOError(msg)
-        catalog_base = self['catalog']['basename']
-        catalog_path = os.path.join(catalog_dir,catalog_base)
+        hats = bool(self['catalog'].get('hats'))
+        if hats:
+            # Catalog comes from a HATS catalog (see
+            # ugali.observation.hats_catalog); there are no per-pixel
+            # catalog files, so every pixel is considered covered and
+            # only the mask files decide which pixels exist.
+            catalog_dir = None
+            catalog_path = 'hats:%i'
+        else:
+            catalog_dir = os.path.expandvars(self['catalog']['dirname'])
+            if not os.path.isdir(catalog_dir):
+                msg = "Directory does not exist: %s"%catalog_dir
+                raise IOError(msg)
+            catalog_base = self['catalog']['basename']
+            catalog_path = os.path.join(catalog_dir,catalog_base)
 
-        mask_dir    = os.path.expandvars(self['mask']['dirname'])
-        if not os.path.isdir(mask_dir):
-            msg = "Directory does not exist: %s"%mask_dir
-            raise IOError(msg)
-        mask_base_1 = self['mask']['basename_1']
-        mask_base_2 = self['mask']['basename_2']
-        mask_path_1 = os.path.join(mask_dir,mask_base_1)
-        mask_path_2 = os.path.join(mask_dir,mask_base_2)
+        healsparse = self['mask'].get('healsparse')
+        if healsparse:
+            # Masks come from HealSparse depth maps: a pixel exists when
+            # the maps of both bands cover it (see healsparse_mask).
+            mask_dir = None
+            mask_path_1 = 'healsparse:%i'
+            mask_path_2 = 'healsparse:%i'
+        else:
+            mask_dir    = os.path.expandvars(self['mask']['dirname'])
+            if not os.path.isdir(mask_dir):
+                msg = "Directory does not exist: %s"%mask_dir
+                raise IOError(msg)
+            mask_base_1 = self['mask']['basename_1']
+            mask_base_2 = self['mask']['basename_2']
+            mask_path_1 = os.path.join(mask_dir,mask_base_1)
+            mask_path_2 = os.path.join(mask_dir,mask_base_2)
 
         data = np.ma.empty(npix,dtype=[('pix',int), ('catalog',object), 
                                        ('mask_1',object), ('mask_2',object)])
@@ -222,9 +246,17 @@ class Config(dict):
         data['mask_2']  = np.char.mod(mask_path_2,pixels)
 
         # Build the mask of existing files using glob
-        mask['catalog'] = ~np.isin(data['catalog'],glob.glob(catalog_dir+'/*'))
-        mask['mask_1']  = ~np.isin(data['mask_1'],glob.glob(mask_dir+'/*'))
-        mask['mask_2']  = ~np.isin(data['mask_2'],glob.glob(mask_dir+'/*'))
+        if hats:
+            mask['catalog'] = False
+        else:
+            mask['catalog'] = ~np.isin(data['catalog'],glob.glob(catalog_dir+'/*'))
+        if healsparse:
+            from ugali.observation.healsparse_mask import covered_pixels
+            mask['mask_1'] = ~covered_pixels(healsparse['maglim_1'],nside_catalog)
+            mask['mask_2'] = ~covered_pixels(healsparse['maglim_2'],nside_catalog)
+        else:
+            mask['mask_1']  = ~np.isin(data['mask_1'],glob.glob(mask_dir+'/*'))
+            mask['mask_2']  = ~np.isin(data['mask_2'],glob.glob(mask_dir+'/*'))
 
         for name in ['catalog','mask_1','mask_2']:
             if np.all(mask[name]): logger.warning("All '%s' files masked"%name)
