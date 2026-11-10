@@ -17,6 +17,13 @@ Designed for long, resumable runs:
   * the default number of workers is limited by the available memory.
 """
 import os
+# numpy asks the kernel for transparent huge pages on every allocation >= 4 MB.
+# On a shared node with a large, fragmented page cache every such fault can
+# stall in direct memory compaction: in dense fields 96 workers were measured
+# at ~96% system CPU and 0.5 pixels/s, versus 15-30 pixels/s with the request
+# disabled (/proc/vmstat: compact_stall, thp_fault_alloc). Must be set before
+# numpy is imported; an explicit value in the environment is respected.
+os.environ.setdefault('NUMPY_MADVISE_HUGEPAGE', '0')
 import sys
 import csv
 import time
