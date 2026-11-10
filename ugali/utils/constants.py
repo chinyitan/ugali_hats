@@ -180,6 +180,17 @@ MAGERR_PARAMS = dict(
         'i': [ -0.9117, -2.3741, 0.0005],
         },
 
+    # Euclid Q1 MER final catalogue (HATS), VIS = FLUX_VIS_PSF, H = FLUX_H_TEMPLFIT
+    # (+0.10 mag colour term), fitted to the median reported magerr per 0.1 mag of
+    # delta = maglim - mag for the stream-search selection (point sources) against
+    # the dereddened depth maps used by the search: VIS maglim = min(10 sigma,
+    # I_E 23.5 classifier limit), H maglim = 10 sigma (noise-model method of
+    # streamobs). See projects/euclid/ugali/q1/fit_magerr.py (2026-11).
+    euclid_q1 = {
+        'VIS': [ -0.5860, -4.1791, 0.0008],
+        'H'  : [ -0.6733, -2.2117, 0.0030],
+        },
+
     # This is fit from some curves that Keith made
     ps1_dr1 = {
         'g' : [-0.84967134, -2.27897518,  0.00304501],
