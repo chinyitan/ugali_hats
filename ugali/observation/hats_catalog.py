@@ -100,7 +100,11 @@ def add_derived(data, derived):
     env = {name: data[name] for name in names}
     new = []
     for name, expr in derived.items():
-        val = eval(str(expr), {'np': np, '__builtins__': {}}, env)
+        # Invalid inputs (e.g. log10 of a non-positive flux) legitimately give
+        # NaN; silence the floating-point warnings, whose machinery would
+        # otherwise need __import__, which the restricted builtins remove.
+        with np.errstate(all='ignore'):
+            val = eval(str(expr), {'np': np, '__builtins__': {}}, env)
         val = np.broadcast_to(np.asarray(val), (len(data),))
         env[name] = val
         new.append((name, val))

@@ -208,6 +208,18 @@ def test_add_derived():
     assert hc.derived_inputs({'C': 'A - 2 * B', 'D': 'np.abs(C)'}) == ['A', 'B', 'np', 'abs', 'C']
 
 
+def test_add_derived_invalid_values():
+    """Flux -> magnitude of non-positive/NaN fluxes gives NaN, not an error
+    (the floating-point warning used to need __import__ in the restricted eval)."""
+    import warnings
+    rec = np.zeros(3, dtype=[('F', 'f4')])
+    rec['F'] = [1.0, -1.0, np.nan]
+    with warnings.catch_warnings():
+        warnings.simplefilter('error')
+        out = hc.add_derived(rec, {'M': '-2.5 * np.log10(F) + 23.9'})
+    np.testing.assert_allclose(out['M'], [23.9, np.nan, np.nan])
+
+
 def test_table_to_recarray_null_bool():
     tab = pa.table({'F': pa.array([True, None, False], type=pa.bool_()),
                     'X': pa.array([1.0, None, 3.0])})
