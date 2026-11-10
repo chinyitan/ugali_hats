@@ -183,6 +183,21 @@ BLAS in each of 48 workers was measured 3x slower); set `OMP_NUM_THREADS`
 yourself to override. The stats file records the setup (catalog/mask load)
 and search time of every pixel separately.
 
+Two stalls seen on a shared 256-core node, with their fixes:
+* *Memory compaction.* numpy requests transparent huge pages for every
+  array over 4 MB; with a large fragmented page cache each request can stall
+  in direct compaction. In dense (bulge-direction) fields 96 workers ran at
+  96% system CPU and 0.5 pixels/s; with the request disabled they ran at
+  15-30 pixels/s. The driver now sets `NUMPY_MADVISE_HUGEPAGE=0` before
+  importing numpy (an explicit value in the environment wins). Diagnose with
+  `vmstat` (system vs user time) and `/proc/vmstat` `compact_stall`.
+* *Slow home directory.* ugali calls `mkdir` on its data directory and reads
+  the isochrone files for every pixel. If `~/.ugali` is on a slow or
+  overloaded NFS server every worker sits in `mkdir` (state D). Point
+  `UGALIDIR` at a copy of the isochrones on fast storage.
+To stop a run, kill the driver's process tree; a `pkill -f` whose pattern
+also appears in the calling shell's command line kills the caller.
+
 Several steps of the grid search are reorganized so that they do strictly
 less work with the same arithmetic, and the outputs are bit-for-bit those of
 the original loops (verified on the 704-pixel DES Y6 reference region):
@@ -258,6 +273,41 @@ expected payoff:
   (313k files in about a minute on 48 workers); the stock serial merge step
   does not scale to a full survey. The search step still needs to be
   pointed at the collated arrays.
+
+#### Cleaning the collated maps
+
+`ugali/analysis/postproc.py` applies the post-hoc remedies that were
+validated on the DELVE DR3 scans (hotspot study of the Galactic-north
+rescan, 164k targets, checked against the galstreams tracks and the LVDB
+satellites in the footprint):
+
+* a scan-level fix first: `fractype: binary` plus a `fracdet` map zeroed
+  where the scan-selected star counts fall below half the local level (and
+  inside holes around bright globular clusters) removed the ~2 deg ROI
+  hotspots: cells above TS 25 fell from 7.8% to 4.5% of the region, above
+  TS 10 from 20% to 14%;
+* `roi_density_ratio` + a threshold of 1.10 on the bright selected-star
+  counts masks the remaining interior/annulus mismatches, and
+  `median_subtract` removes the modulus-independent excess (together: 2.8%
+  of the cells masked, TS > 25 down to 3.0%);
+* the "all-modulus" hotspots (TS > 10 at every modulus, 0.7% of the cells,
+  TS in the thousands) are dusty bulge-direction fields: the SFD
+  dereddening over-corrects there and shifts the stellar locus 0.01-0.02
+  mag blue relative to the annulus, which the likelihood reads as signal at
+  every distance. Their rate rises from 0.2% of cells at E(B-V) < 0.05 to
+  13% at E(B-V) > 0.5. `ebv_mask` at E(B-V) > 0.2 costs 6% of the cells and
+  removes 60% of them; a faint-end (22.5 < g < 23.5) density-ratio mask at
+  1.25 catches most of the rest. Things that did *not* fix them: capping
+  the magnitude range (g < 23 or 22.5 cures 5 of 40 and worsens others), a
+  per-cell stellar-locus colour correction (the locus scatters by 0.04 mag
+  between neighbouring cells inside the dusty fields), and a sector-median
+  background estimate (it inflates clean fields);
+* `protect_objects` keeps the cells around catalogued dwarfs and clusters,
+  which raise their own interior counts.
+
+The remaining small round spots at large modulus are Poisson noise of the
+few faint objects per kernel and need a shape criterion rather than a
+mask; a directional (line) filter is being evaluated.
 
 See `notebooks/hats_io_validation.ipynb` for the validation against the FITS
 path and timings, and `tests/test_des_scan.py` / `tests/test_hats_catalog.py`.
