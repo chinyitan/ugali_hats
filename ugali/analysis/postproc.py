@@ -76,13 +76,17 @@ def targets_of(pixel, nside, nside_target):
 
 
 def roi_density_ratio(counts, nside_counts, footprint, targets, nside_target,
-                      r_in=0.5, r_out=2.0, workers=1):
+                      r_in=0.5, r_out=2.0, workers=1, weights=None):
     """Interior/annulus density ratio of a full-sky NESTED count map per target.
 
     `footprint` is a boolean full-sky NESTED map at `nside_counts` of the
-    cells the scan covered (only those count towards the areas). Returns an
+    cells the scan covered. `weights` (same shape, optional) is the detection
+    fraction the scan used: cells with weight 0 contribute neither counts
+    nor area, so tiles the scan masked do not bias the annulus. Returns an
     array aligned with `targets` (NaN where the annulus is empty)."""
     cells = np.where(footprint)[0]
+    w = np.ones(len(cells)) if weights is None else np.asarray(weights, float)[cells]
+    c = counts[cells] * (w > 0)
     tree = cKDTree(np.array(hp.pix2vec(nside_counts, cells, nest=True)).T)
     q = np.array(hp.pix2vec(nside_target, targets, nest=True)).T
     out = np.full(len(targets), np.nan)
@@ -91,9 +95,9 @@ def roi_density_ratio(counts, nside_counts, footprint, targets, nside_target,
         for R in (r_in, r_out):
             nbr = tree.query_ball_point(q[a:a + 20000], chord(R), workers=workers, return_sorted=False)
             n = np.array([len(x) for x in nbr])
-            flat = cells[np.concatenate(nbr).astype(np.int64)] if n.sum() else np.zeros(0, int)
+            flat = np.concatenate(nbr).astype(np.int64) if n.sum() else np.zeros(0, int)
             seg = np.repeat(np.arange(len(n)), n)
-            sums.append((np.bincount(seg, counts[flat], minlength=len(n)), n.astype(float)))
+            sums.append((np.bincount(seg, c[flat], minlength=len(n)), np.bincount(seg, w[flat], minlength=len(n))))
         (ci, ni), (co, no) = sums
         with np.errstate(all='ignore'):
             out[a:a + len(ni)] = (ci / ni) / ((co - ci) / (no - ni))
@@ -118,9 +122,21 @@ def protect_objects(pixel, nside, ra, dec, radius=1.0):
     return out
 
 
+def fracdet_weights(path, nside, fracmin=0.3):
+    """Binary detection-fraction weights (full-sky NESTED at `nside`) from a healsparse map."""
+    import healsparse as hsp
+    m = hsp.HealSparseMap.read(path)
+    w = np.zeros(hp.nside2npix(nside))
+    ra, dec = hp.pix2ang(nside, np.arange(hp.nside2npix(nside)), nest=True, lonlat=True)
+    v = m.get_values_pos(ra, dec, lonlat=True)
+    w[(v != hp.UNSEEN) & (v >= fracmin)] = 1.0
+    return w
+
+
 def clean(pixel, nside, ts, ratio_masks=(), ebv=None, ebv_max=0.2,
-          protect=None, protect_radius=1.0, nside_target=256, subtract_median=True):
-    """Apply the recipe. `ratio_masks` is a list of (counts map NESTED at `nside`, threshold).
+          protect=None, protect_radius=1.0, nside_target=256, subtract_median=True, weights=None):
+    """Apply the recipe. `ratio_masks` is a list of (counts map NESTED at `nside`, threshold);
+    `weights` is the scan's detection fraction (see `fracdet_weights`).
 
     Returns (cleaned TS with NaN in masked cells, mask)."""
     targets, it = targets_of(pixel, nside, nside_target)
@@ -128,7 +144,7 @@ def clean(pixel, nside, ts, ratio_masks=(), ebv=None, ebv_max=0.2,
     footprint[hp.ring2nest(nside, pixel)] = True
     mask = np.zeros(len(pixel), bool)
     for counts, thr in ratio_masks:
-        r = roi_density_ratio(counts, nside, footprint, targets, nside_target)
+        r = roi_density_ratio(counts, nside, footprint, targets, nside_target, weights=weights)
         mask |= ((r > thr) | ~np.isfinite(r))[it]
     if protect is not None:
         mask &= ~protect_objects(pixel, nside, protect[0], protect[1], protect_radius)
@@ -148,6 +164,9 @@ def main():
                    help='NPZFILE:KEY of a full-sky NESTED count map at the cube nside (repeatable)')
     p.add_argument('--ratio-max', action='append', type=float, default=[],
                    help='interior/annulus ratio threshold for the corresponding --counts')
+    p.add_argument('--fracdet', help='healsparse detection-fraction map the scan used; cells below '
+                   '--fracmin contribute neither counts nor area to the density ratios')
+    p.add_argument('--fracmin', type=float, default=0.3)
     p.add_argument('--ebv', help='full-sky RING E(B-V) HEALPix map (fits)')
     p.add_argument('--ebv-max', type=float, default=0.2)
     p.add_argument('--protect', help='CSV with ra,dec columns of objects to keep')
@@ -168,8 +187,9 @@ def main():
         import pandas as pd
         t = pd.read_csv(a.protect)
         protect = (t['ra'].values, t['dec'].values)
+    weights = fracdet_weights(a.fracdet, nside, a.fracmin) if a.fracdet else None
     out, mask = clean(pixel, nside, ts, ratio_masks, ebv, a.ebv_max, protect, a.protect_radius,
-                      a.nside_target, a.median_subtract)
+                      a.nside_target, a.median_subtract, weights)
     save_cube(a.outfile, pixel, nside, mus, out, keep=~mask)
     print('masked %.2f%% of %d cells; wrote %s' % (100 * mask.mean(), len(mask), a.outfile))
 

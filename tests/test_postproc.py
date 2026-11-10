@@ -40,6 +40,26 @@ def test_roi_density_ratio_flags_overdense_interior():
     assert np.nanmedian(r[far]) == pytest.approx(1.0, abs=0.05)
 
 
+def test_roi_density_ratio_weights_ignore_masked_tiles():
+    """A masked tile with anomalous counts in the annulus must not bias the ratio when weighted."""
+    nside, nside_t = 256, 64
+    pix = _region(nside)
+    footprint = np.zeros(hp.nside2npix(nside), bool)
+    footprint[hp.ring2nest(nside, pix)] = True
+    counts = np.where(footprint, 10.0, 0.0)
+    targets, it = pp.targets_of(pix, nside, nside_t)
+    t0 = targets[len(targets) // 2]
+    ra, dec = hp.pix2ang(nside_t, t0, lonlat=True, nest=True)
+    # an "incomplete tile" 1 deg away with a fifth of the counts, as a scan-masked region
+    bad = hp.query_disc(nside, hp.ang2vec(ra + 1.0, dec, lonlat=True), np.radians(0.5), nest=True)
+    counts[bad] = 2.0
+    w = footprint.astype(float); w[bad] = 0.0
+    i0 = np.searchsorted(targets, t0)
+    r_unw = pp.roi_density_ratio(counts, nside, footprint, targets, nside_t)[i0]
+    r_w = pp.roi_density_ratio(counts, nside, footprint, targets, nside_t, weights=w)[i0]
+    assert r_unw > 1.05 and r_w == pytest.approx(1.0, abs=0.02)
+
+
 def test_ebv_mask_and_protect():
     nside = 256
     pix = _region(nside)

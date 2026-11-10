@@ -304,6 +304,11 @@ satellites in the footprint):
   background estimate (it inflates clean fields);
 * `protect_objects` keeps the cells around catalogued dwarfs and clusters,
   which raise their own interior counts.
+* the density ratios must be weighted by the detection fraction the scan
+  used (`--fracdet`): tiles the scan masked have anomalous counts and
+  otherwise bias the annulus. Weighted, the whole recipe masks 8.5% of the
+  north region and removes 74% of the all-modulus hotspot cells; unweighted
+  it masks 11.8% for 77%.
 
 The remaining small round spots at large modulus are Poisson noise of the
 few faint objects per kernel and need a shape criterion rather than a
