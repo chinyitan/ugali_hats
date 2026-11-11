@@ -168,6 +168,29 @@ MAGERR_PARAMS = dict(
         'r': [ -0.9074, -1.9474, 0.0005],
         },
 
+    # Rubin DP2: fit to the median {b}_psfMagErr of point sources
+    # (refExtendedness<0.5, band unflagged; 3% random subsample of the
+    # object_lc HATS catalog) in 0.1 mag bins of maglim-mag, for delta>=0.
+    # maglim is the DP2 psf_maglim (5 sigma) depth map minus 0.75 mag
+    # (~10 sigma), which is how the DP2 stream search uses the maps (2026-11)
+    lsst_dp2 = {
+        'u': [ -0.8401, -2.3476, 0.0016],
+        'g': [ -0.8990, -2.3652, 0.0008],
+        'r': [ -0.9052, -2.3690, 0.0006],
+        'i': [ -0.9117, -2.3741, 0.0005],
+        },
+
+    # Euclid Q1 MER final catalogue (HATS), VIS = FLUX_VIS_PSF, H = FLUX_H_TEMPLFIT
+    # (+0.10 mag colour term), fitted to the median reported magerr per 0.1 mag of
+    # delta = maglim - mag for the stream-search selection (point sources) against
+    # the dereddened depth maps used by the search: VIS maglim = min(10 sigma,
+    # I_E 23.5 classifier limit), H maglim = 10 sigma (noise-model method of
+    # streamobs). See projects/euclid/ugali/q1/fit_magerr.py (2026-11).
+    euclid_q1 = {
+        'VIS': [ -0.5860, -4.1791, 0.0008],
+        'H'  : [ -0.6733, -2.2117, 0.0030],
+        },
+
     # This is fit from some curves that Keith made
     ps1_dr1 = {
         'g' : [-0.84967134, -2.27897518,  0.00304501],

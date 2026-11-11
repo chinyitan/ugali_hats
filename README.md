@@ -146,6 +146,25 @@ shows up as a 1-ulp change of LOG_LIKELIHOOD in a few percent of pixels where
 TS < 1e-4 (5 of 704 pixels in the DES Y6 reference region). The mask files
 are still read from `mask: dirname`.
 
+Columns that the catalog does not provide directly (e.g. extinction-corrected
+magnitudes) can be computed per partition with `derived`, a mapping of new
+column name to a numpy expression of the catalog columns (`np` is available;
+expressions are evaluated in order, so later ones may use earlier ones):
+```yaml
+catalog:
+  hats:
+    path: /path/to/rubin_dp2/object_collection/object_lc
+    derived:
+      g_psfMag_dered: "g_psfMag - 3.64 * ebv"
+      r_psfMag_dered: "r_psfMag - 2.70 * ebv"
+  mag_1_field: g_psfMag_dered
+  mag_2_field: r_psfMag_dered
+```
+The derived columns are added before the `selection` is applied, so the
+selection and the `*_field` keys may name them; their inputs are read instead
+of them (only identifiers that are catalog columns are read). Null boolean
+values (e.g. flags of a band without a measurement) are read as `False`.
+
 Depth masks can likewise be read from [HealSparse](https://healsparse.readthedocs.io)
 maps instead of the per-pixel mask files, by replacing `dirname`/`basename_*`
 in the `mask` section with:
@@ -253,10 +272,11 @@ expected payoff:
   be badly over-estimated. Besides masking such tiles through an explicit
   `fracdet` map, the ratio of the interior to annulus bright-object density
   per target pixel is a cheap post-hoc flag.
-* *A parallel collator.* The stock merge step reads the per-pixel FITS
-  outputs serially, which does not scale to the ~300k files of a full
-  survey; a parallel collation into one table per distance modulus is
-  needed before the search step.
+* *Collation.* `ugali/analysis/collate.py` reads the per-pixel FITS
+  outputs with a process pool into one `.npz` of (cell, modulus) arrays
+  (313k files in about a minute on 48 workers); the stock serial merge step
+  does not scale to a full survey. The search step still needs to be
+  pointed at the collated arrays.
 
 See `notebooks/hats_io_validation.ipynb` for the validation against the FITS
 path and timings, and `tests/test_des_scan.py` / `tests/test_hats_catalog.py`.
